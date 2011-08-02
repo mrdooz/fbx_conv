@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <map>
 #include <set>
+#include <queue>
+#include <assert.h>
 
 using namespace std;
 
@@ -18,6 +20,26 @@ using namespace std;
 #else
 #pragma comment(lib, "fbxsdk-2012.1.lib")
 #endif
+
+namespace BlockId {
+	enum Enum {
+		kMaterials,
+		kMeshes
+	};
+}
+
+#pragma pack(push, 1)
+struct MainHeader {
+	int material_ofs;
+	int mesh_ofs;
+	int string_ofs;
+};
+
+struct BlockHeader {
+	BlockId::Enum id;
+	int size;	// size excl header
+};
+#pragma pack(pop)
 
 template<class T> 
 void seq_delete(T* t) {
@@ -32,6 +54,99 @@ void assoc_delete(T* t) {
 		delete it->second;
 	t->clear();
 }
+
+class Writer {
+public:
+	Writer() : _f(nullptr) {}
+	~Writer() {
+		if (_f)
+			fclose(_f);
+	}
+
+	struct DeferredString {
+		DeferredString(int ofs, const string &str) : ofs(ofs), str(str) {}
+		int ofs;
+		string str;
+	};
+
+	vector<DeferredString> _deferred_strings;
+
+	bool open(const char *filename) {
+		if (!(_f = fopen(filename, "wb")))
+			return false;
+		return true;
+	}
+
+	void close() {
+		fclose(_f);
+	}
+
+	void add_deferred_string(const string &str) {
+		int p = pos();
+		_deferred_strings.push_back(DeferredString(p, str));
+		write(p);
+	}
+
+	void save_strings() {
+
+		// save the # deferred strings and their locations
+		write((int)_deferred_strings.size());
+		for (size_t i = 0; i<  _deferred_strings.size(); ++i)
+			write(_deferred_strings[i].ofs);
+
+		for (size_t i = 0; i < _deferred_strings.size(); ++i) {
+			// for each deferred string, save the string, and update the
+			// inplace offset to point to it
+			int p = pos();
+			write_raw(_deferred_strings[i].str.c_str(), _deferred_strings[i].str.size() + 1);
+			push_pos();
+			set_pos(_deferred_strings[i].ofs);
+			write(p);
+			pop_pos();
+		}
+	}
+
+	template <class T>
+	void write(const T& data) {
+		fwrite(&data, 1, sizeof(T), _f);
+	}
+
+	void write_raw(const void *data, int len) {
+		fwrite(data, 1, len, _f);
+	}
+
+	void push_pos() {
+		_file_pos_stack.push_back(ftell(_f));
+	}
+
+	void pop_pos() {
+		assert(!_file_pos_stack.empty());
+		int p = _file_pos_stack.back();
+		_file_pos_stack.pop_back();
+		fseek(_f, p, SEEK_SET);
+	}
+
+	int pos() {
+		return ftell(_f);
+	}
+
+	void set_pos(int p) {
+		fseek(_f, p, SEEK_SET);
+	}
+
+	void push_exch() {
+		// push the current position, and move to last on the stack
+		assert(!_file_pos_stack.empty());
+
+		int p = ftell(_f);
+		pop_pos();
+		_file_pos_stack.push_back(p);
+	}
+
+private:
+	deque<int> _file_pos_stack;
+	FILE *_f;
+};
 
 enum ParamType {
 	kInt = 1,
@@ -66,9 +181,7 @@ enum SubBufferType {
 };
 
 struct SuperVertex {
-	SuperVertex(const KFbxVector4 &pos, const KFbxVector4 &normal, const KFbxVector2 &uv0, int idx) : pos(pos), normal(normal), idx(idx) {
-		uv.push_back(uv0);
-	}
+	SuperVertex(const KFbxVector4 &pos, const KFbxVector4 &normal) : pos(pos), normal(normal), idx(-1) {}
 	KFbxVector4 pos;
 	KFbxVector4 normal;
 	vector<KFbxVector2> uv;
@@ -160,7 +273,8 @@ struct Scene {
 		seq_delete(&meshes);
 	}
 
-	map<string, Material *> materials;
+	typedef map<string, Material *> Materials;
+	Materials materials;
 	vector<Mesh *> meshes;
 };
 
@@ -206,9 +320,13 @@ private:
 
 	bool export_mesh(KFbxNode *node, KFbxMesh *mesh);
 	void traverse_scene(KFbxScene *scene);
+	bool save_scene(const char *dst);
+	bool save_meshes();
+	bool save_materials();
 
 	vector<string> _errors;
 	Scene _scene;
+	Writer _writer;
 
 	KFbxSdkManager *_mgr;
 	KFbxIOSettings *_settings;
@@ -239,6 +357,7 @@ bool FbxConverter::convert(const char *src, const char *dst) {
 	KFbxScene *scene = KFbxScene::Create(_mgr, "my_scene");
 	_importer->Import(scene);
 	traverse_scene(scene);
+	save_scene(dst);
 
 	scene->Destroy();
 
@@ -308,6 +427,7 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 		uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
 	Mesh *mesh = new Mesh;
+	_scene.meshes.push_back(mesh);
 
 	// each material used for the mesh creates a sub mesh
 	for (size_t i = 0; i < polys_by_material.size(); ++i) {
@@ -316,6 +436,8 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 		set<SuperVertex> super_verts;
 
 		SubMesh *sub_mesh = new SubMesh(fbx_node->GetMaterial(i)->GetName());
+		mesh->sub_meshes.push_back(sub_mesh);
+
 		const PolyIndices &indices = polys_by_material[i];
 		for (size_t j = 0; j < indices.size(); ++j) {
 			const int poly_idx = indices[j];
@@ -323,13 +445,16 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
 			for (int k = 0; k < 3; ++k) {
 				KFbxVector4 normal;
-				KFbxVector2 uv0;
 				KFbxVector4 pos = fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k));
+				SuperVertex cand(pos, normal);
 				fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
-				fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[0].c_str(), uv0);
+				for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
+					KFbxVector2 uv;
+					fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
+					cand.uv.push_back(uv);
+				}
 
 				int idx = -1;
-				SuperVertex cand(pos, normal, uv0, -1);
 				set<SuperVertex>::iterator it = super_verts.find(cand);
 				if (it == super_verts.end()) {
 					idx = cand.idx = sub_mesh->verts.size();
@@ -341,47 +466,8 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 				sub_mesh->indices.push_back(idx);
 			}
 		}
-		mesh->sub_meshes.push_back(sub_mesh);
 	}
 
-	_scene.meshes.push_back(mesh);
-
-
-//	mesh->GetNormals()
-/*
-	KFbxLayerElementNormal *normals = layer->GetNormals();
-
-	const KFbxLayerElementArrayTemplate<KFbxVector4> &arr = normals->GetDirectArray();
-	const KFbxLayerElementArrayTemplate<int> &arr2 = normals->GetIndexArray();
-	int c = arr.GetCount();
-	int c2 = arr2.GetCount();
-	int cc = mesh->GetControlPointsCount();
-	int b = mesh->GetElementNormalCount();
-
-	for (int i = 0; i < mesh->GetLayerCount(); ++i) {
-		KFbxLayer *layer = mesh->GetLayer(i);
-		const int uv_set_count = layer->GetUVSetCount();
-		KArrayTemplate<const KFbxLayerElementUV *> uvs = layer->GetUVSets();
-		for (int j = 0; j < uv_set_count; ++j) {
-			const char *uv_set_name = uvs[j]->GetName();
-			KFbxLayerElement::EMappingMode mm = uvs[j]->GetMappingMode();
-			int a = 10;
-			
-		}
-		int a = 10;
-	}
-
-	int max_p = 0;
-	int aaa = mesh->GetPolygonCount();
-	for (int i = 0; i < mesh->GetPolygonCount(); ++i) {
-		const int verts_in_poly = mesh->GetPolygonSize(i);
-		for (int j = 0; j < verts_in_poly; ++j) {
-			int v = mesh->GetPolygonVertex(i, j);
-			max_p = max(v, max_p);
-			int a = 0;
-		}
-	}
-*/
 	return true;
 }
 
@@ -430,12 +516,115 @@ void FbxConverter::traverse_scene(KFbxScene *scene) {
 	}
 }
 
+bool FbxConverter::save_scene(const char *dst) {
+	// the scene is saved so it can be read in a single sequential read,
+	// and then a simple fixup applied to the pointers
+
+	if (!_writer.open(dst))
+		return false;
+
+	MainHeader header;
+	_writer.push_pos();
+	_writer.write(header);
+
+	header.material_ofs = _writer.pos();
+	if (!save_materials())
+		return false;
+
+	header.mesh_ofs = _writer.pos();
+	if (!save_meshes())
+		return false;
+
+	header.string_ofs = _writer.pos();
+	_writer.save_strings();
+	_writer.push_exch();
+	_writer.write(header);
+	_writer.pop_pos();
+
+	return true;
+}
+
+bool FbxConverter::save_meshes() {
+	return true;
+}
+
+bool FbxConverter::save_materials() {
+
+	BlockHeader header;
+	header.id = BlockId::kMaterials;
+	_writer.push_pos();
+	_writer.write(header);
+	int block_start = _writer.pos();
+
+	_writer.write((int)_scene.materials.size());
+	for (Scene::Materials::iterator it = _scene.materials.begin(); it != _scene.materials.end(); ++it) {
+		const Material *mat = it->second;
+		_writer.add_deferred_string(mat->name);
+		_writer.write((int)mat->properties.size());
+		for (size_t i = 0; i < mat->properties.size(); ++i) {
+			const MaterialProperty &prop = mat->properties[i];
+			_writer.add_deferred_string(prop.name);
+			_writer.write(prop.type);
+			switch (prop.type) {
+			case kInt:
+				_writer.write(prop._int);
+				break;
+			case kFloat:
+				_writer.write_raw(&prop._float[0], sizeof(float));
+				break;
+			case kFloat4:
+				_writer.write_raw(&prop._float[0], 4 * sizeof(float));
+				break;
+			}
+		}
+
+	}
+
+	header.size = _writer.pos() - block_start;
+	_writer.push_exch();
+	_writer.write(header);
+	_writer.pop_pos();
+
+	return true;
+}
+
+void test_load(const char *filename) {
+	FILE *f = fopen(filename, "rb");
+	fseek(f, 0, SEEK_END);
+	int len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char *buf = new char[len];
+	fread(buf, 1, len, f);
+	MainHeader *header = (MainHeader *)buf;
+
+	int *pp = (int *)(buf + header->string_ofs);
+	int count = *pp++;
+	for (int i = 0; i < count; ++i) {
+		int *ofs = (int *)(buf + pp[i]);
+		*ofs += (int)buf;
+		const char *tmp = (const char *)*ofs;
+		int a = 10;
+	}
+
+	delete [] buf;
+
+	fclose(f);
+
+}
+
 int _tmain(int argc, _TCHAR* argv[])
 {
 
+	const char *dst = "c:\\temp\\torus.kumi";
+
 	FbxConverter converter;
-	if (!converter.convert("C:\\Users\\dooz\\Documents\\3dsMax\\export\\torus.fbx", NULL))
-		return 1;
+	if (!converter.convert("C:\\Users\\dooz\\Documents\\3dsMax\\export\\torus.fbx", dst)) {
+		if (!converter.convert("C:\\Users\\dooz\\Dropbox\\export\\torus.fbx", dst)) {
+			return 1;
+		}
+	}
+
+	test_load(dst);
 
 	return 0;
 }
