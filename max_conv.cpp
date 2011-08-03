@@ -123,6 +123,7 @@ public:
 		for (size_t i = 0; i < _deferred_binary.size(); ++i) {
 			// the offset is relative the start of the binary block
 			int p = pos() - binary_start;
+			write(_deferred_binary[i].len);
 			write_raw(_deferred_binary[i].data, _deferred_binary[i].len);
 			push_pos();
 			set_pos(_deferred_binary[i].ofs);
