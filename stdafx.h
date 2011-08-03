@@ -5,11 +5,14 @@
 
 #pragma once
 
-#include "targetver.h"
-
 #include <stdio.h>
 #include <tchar.h>
 
-
-
-// TODO: reference additional headers your program requires here
+#include <fbxsdk.h>
+#include <string>
+#include <vector>
+#include <stdint.h>
+#include <map>
+#include <set>
+#include <queue>
+#include <assert.h>

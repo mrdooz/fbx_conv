@@ -1,15 +1,4 @@
-// max_conv.cpp : Defines the entry point for the console application.
-//
-
 #include "stdafx.h"
-#include <fbxsdk.h>
-#include <string>
-#include <vector>
-#include <stdint.h>
-#include <map>
-#include <set>
-#include <queue>
-#include <assert.h>
 
 using namespace std;
 
@@ -21,19 +10,21 @@ using namespace std;
 #pragma comment(lib, "fbxsdk-2012.1.lib")
 #endif
 
+#pragma pack(push, 1)
+struct MainHeader {
+	int material_ofs;
+	int mesh_ofs;
+	int string_ofs;
+	int binary_ofs;
+	int total_size;
+};
+
 namespace BlockId {
 	enum Enum {
 		kMaterials,
 		kMeshes
 	};
 }
-
-#pragma pack(push, 1)
-struct MainHeader {
-	int material_ofs;
-	int mesh_ofs;
-	int string_ofs;
-};
 
 struct BlockHeader {
 	BlockId::Enum id;
@@ -61,6 +52,10 @@ public:
 	~Writer() {
 		if (_f)
 			fclose(_f);
+
+		for (size_t i = 0; i < _deferred_binary.size(); ++i)
+			delete [] _deferred_binary[i].data;
+		_deferred_binary.clear();
 	}
 
 	struct DeferredString {
@@ -69,7 +64,12 @@ public:
 		string str;
 	};
 
-	vector<DeferredString> _deferred_strings;
+	struct DeferredBinary {
+		DeferredBinary(int ofs, void *data, int len) : ofs(ofs), data(data), len(len) {}
+		int ofs;
+		void *data;
+		int len;
+	};
 
 	bool open(const char *filename) {
 		if (!(_f = fopen(filename, "wb")))
@@ -87,6 +87,12 @@ public:
 		write(p);
 	}
 
+	void add_deferred_binary(void *data, int len) {
+		int p = pos();
+		_deferred_binary.push_back(DeferredBinary(p, data, len));
+		write(p);
+	}
+
 	void save_strings() {
 
 		// save the # deferred strings and their locations
@@ -101,6 +107,25 @@ public:
 			write_raw(_deferred_strings[i].str.c_str(), _deferred_strings[i].str.size() + 1);
 			push_pos();
 			set_pos(_deferred_strings[i].ofs);
+			write(p);
+			pop_pos();
+		}
+	}
+
+	void save_binary() {
+		// we assume that the binary data is going to be transient,
+		// so all the offsets are relative the binary block
+		int binary_start = pos();
+		write((int)_deferred_binary.size());
+		for (size_t i = 0; i < _deferred_binary.size(); ++i)
+			write(_deferred_binary[i].ofs);
+
+		for (size_t i = 0; i < _deferred_binary.size(); ++i) {
+			// the offset is relative the start of the binary block
+			int p = pos() - binary_start;
+			write_raw(_deferred_binary[i].data, _deferred_binary[i].len);
+			push_pos();
+			set_pos(_deferred_binary[i].ofs);
 			write(p);
 			pop_pos();
 		}
@@ -135,7 +160,7 @@ public:
 	}
 
 	void push_exch() {
-		// push the current position, and move to last on the stack
+		// push the current position, and move to the last position on the stack
 		assert(!_file_pos_stack.empty());
 
 		int p = ftell(_f);
@@ -144,8 +169,30 @@ public:
 	}
 
 private:
+	vector<DeferredString> _deferred_strings;
+	vector<DeferredBinary> _deferred_binary;
+
 	deque<int> _file_pos_stack;
 	FILE *_f;
+};
+
+struct ScopedBlock {
+	ScopedBlock(BlockHeader &header, Writer &writer) : header(header), writer(writer) {
+		writer.push_pos();
+		writer.write(header);
+		block_start = writer.pos();
+	}
+
+	~ScopedBlock() {
+		header.size = writer.pos() - block_start;
+		writer.push_exch();
+		writer.write(header);
+		writer.pop_pos();
+	}
+
+	BlockHeader &header;
+	Writer &writer;
+	int block_start;
 };
 
 enum ParamType {
@@ -172,12 +219,6 @@ struct Material {
 	Material(const string &name) : name(name) {}
 	string name;
 	vector<MaterialProperty> properties;
-};
-
-enum SubBufferType {
-	Pos,
-	Normal,
-	Tex,
 };
 
 struct SuperVertex {
@@ -215,38 +256,98 @@ struct SuperVertex {
 	}
 };
 
-struct VertexBuffer {
-	VertexBuffer() : data(nullptr) {}
-	~VertexBuffer() { delete [] data; }
-	struct Sub {
-		SubBufferType type;
-		int elem_size;
-	};
-	int elem_count;
-	int elem_size;
-	vector<Sub> subs;
-	void *data;
+struct Vector2 {
+	Vector2() {}
+	Vector2(const KFbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
+	float x, y;
 };
 
-struct IndexBuffer {
-	IndexBuffer() : data(nullptr) {}
-	~IndexBuffer() { delete [] data; }
-	int elem_count;
-	int elem_size;
-	void *data;
+struct Vector3 {
+	Vector3() {}
+	Vector3(const KFbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
+	float x, y, z;
 };
 
 struct SubMesh {
-	SubMesh(const string &material) : material(material) {}
+
+	enum VertexFlags {
+		kPos     = 1 << 0,
+		kNormal  = 1 << 1,
+		kTex0    = 1 << 2,
+		kTex1    = 1 << 3,
+	};
+
+	SubMesh(const string &material, uint32_t vertex_flags) 
+		: material(material), vertex_flags(vertex_flags)
+	{
+		element_size = vertex_flags & kPos ? sizeof(Vector3) : 0;
+		element_size += vertex_flags & kNormal ? sizeof(Vector3) : 0;
+		element_size += vertex_flags & kTex0 ? sizeof(Vector2) : 0;
+		element_size += vertex_flags & kTex1 ? sizeof(Vector2) : 0;
+	}
 	string material;
-	vector<SuperVertex> verts;
-	vector<int> indices;
+	uint32_t vertex_flags;
+	uint32_t element_size;
+	vector<Vector3> pos;
+	vector<Vector3> normal;
+	vector<Vector2> tex0;
+	vector<Vector2> tex1;
+	vector<uint32_t> indices;
 };
 
+template<typename T>
+T max3(const T &a, const T &b, const T &c) {
+	return max(a, max(b, c));
+}
+
+template<typename T>
+T max4(const T &a, const T &b, const T &c, const T &d) {
+	return max(a, max3(b, c, d));
+}
+
+void compact_vertex_data(const SubMesh &submesh, void **data, int *len) {
+	*len = submesh.element_size * submesh.pos.size();
+	char *buf = new char[*len];
+	*data = buf;
+	for (size_t i = 0; i < submesh.pos.size(); ++i) {
+		*(Vector3 *)buf = submesh.pos[i]; buf += sizeof(submesh.pos[0]);
+		*(Vector3 *)buf = submesh.normal[i]; buf += sizeof(submesh.normal[0]);
+		if (submesh.vertex_flags & SubMesh::kTex0) {
+			*(Vector2 *)buf = submesh.tex0[i]; buf += sizeof(submesh.tex0[0]);
+		}
+		if (submesh.vertex_flags & SubMesh::kTex1) {
+			*(Vector2 *)buf = submesh.tex1[i]; buf += sizeof(submesh.tex1[0]);
+		}
+	}
+}
+
+void compact_index_data(const SubMesh &submesh, void **data, int *len, int *index_size) {
+	// check if we need 16 or 32 bit indices
+	const size_t elems = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
+	const bool need_32_bit = elems >= (1 << 16);
+	*index_size = need_32_bit ? 4 : 2;
+	*len = elems * (*index_size);
+	void *buf = new char[*len];
+	*data = buf;
+	if (need_32_bit) {
+		uint32_t *p = (uint32_t *)buf;
+		for (size_t i = 0; i < elems; ++i) {
+			*p++ = submesh.indices[i];
+		}
+	} else {
+		uint16_t *p = (uint16_t *)buf;
+		for (size_t i = 0; i < elems; ++i) {
+			*p++ = (uint16_t)submesh.indices[i];
+		}
+	}
+}
+
 struct Mesh {
+	Mesh(const string &name) : name(name) {}
 	~Mesh() {
 		seq_delete(&sub_meshes);
 	}
+	string name;
 	vector<SubMesh *> sub_meshes;
 };
 
@@ -274,43 +375,12 @@ struct Scene {
 	}
 
 	typedef map<string, Material *> Materials;
+	typedef vector<Mesh *> Meshes;
+
 	Materials materials;
-	vector<Mesh *> meshes;
+	Meshes meshes;
 };
 
-/*
-struct InPlaceString {
-	const char *str;
-	size_t len;
-};
-
-template< typename T>
-struct InPlaceArray {
-	T *data;
-	size_t len;
-};
-
-struct LinearMemory {
-	LinearMemory(const char *start, size_t len) : _start(start), _len(len) {}
-	const char *_start;
-	size_t _len;
-};
-
-struct Node {
-	Node *parent;
-	vector<Node *> children;
-	uint32_t id;
-};
-
-struct Mesh {
-	string name;
-};
-
-struct Scene {
-	Scene() : root(nullptr) {}
-	Node *root;
-};
-*/
 class FbxConverter {
 public:
 	FbxConverter();
@@ -426,8 +496,11 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 	for (int i = 0; i < layer->GetUVSetCount(); ++i)
 		uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
-	Mesh *mesh = new Mesh;
+	Mesh *mesh = new Mesh(fbx_mesh->GetName());
 	_scene.meshes.push_back(mesh);
+
+	uint32_t vertex_flags = SubMesh::kPos | SubMesh::kNormal;
+	vertex_flags |= uv_sets.size() == 2 ? SubMesh::kTex1 | SubMesh::kTex0 : uv_sets.size() == 1 ? SubMesh::kTex0 : 0;
 
 	// each material used for the mesh creates a sub mesh
 	for (size_t i = 0; i < polys_by_material.size(); ++i) {
@@ -435,7 +508,7 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 		// keep track of the unique vertices
 		set<SuperVertex> super_verts;
 
-		SubMesh *sub_mesh = new SubMesh(fbx_node->GetMaterial(i)->GetName());
+		SubMesh *sub_mesh = new SubMesh(fbx_node->GetMaterial(i)->GetName(), vertex_flags);
 		mesh->sub_meshes.push_back(sub_mesh);
 
 		const PolyIndices &indices = polys_by_material[i];
@@ -443,6 +516,8 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 			const int poly_idx = indices[j];
 			CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
+			// create a supervertex for the current vertex, and check if it already exists to
+			// determine what vertex index to give it
 			for (int k = 0; k < 3; ++k) {
 				KFbxVector4 normal;
 				KFbxVector4 pos = fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k));
@@ -457,10 +532,14 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 				int idx = -1;
 				set<SuperVertex>::iterator it = super_verts.find(cand);
 				if (it == super_verts.end()) {
-					idx = cand.idx = sub_mesh->verts.size();
-					sub_mesh->verts.push_back(cand);
+					idx = cand.idx = sub_mesh->pos.size();
+					sub_mesh->pos.push_back(pos);
+					sub_mesh->normal.push_back(normal);
+					if (vertex_flags & SubMesh::kTex0) sub_mesh->tex0.push_back(cand.uv[0]);
+					if (vertex_flags & SubMesh::kTex1) sub_mesh->tex1.push_back(cand.uv[1]);
 					super_verts.insert(cand);
 				} else {
+					// vertex already exists, so reuse the vertex index
 					idx = it->idx;
 				}
 				sub_mesh->indices.push_back(idx);
@@ -537,6 +616,11 @@ bool FbxConverter::save_scene(const char *dst) {
 
 	header.string_ofs = _writer.pos();
 	_writer.save_strings();
+
+	header.binary_ofs = _writer.pos();
+	_writer.save_binary();
+	header.total_size = _writer.pos();
+
 	_writer.push_exch();
 	_writer.write(header);
 	_writer.pop_pos();
@@ -545,6 +629,39 @@ bool FbxConverter::save_scene(const char *dst) {
 }
 
 bool FbxConverter::save_meshes() {
+
+	BlockHeader header;
+	header.id = BlockId::kMeshes;
+	ScopedBlock scoped_block(header, _writer);
+
+	Scene::Meshes &meshes = _scene.meshes;
+
+	_writer.write((int)meshes.size());
+	for (size_t i = 0; i < meshes.size(); ++i) {
+		Mesh *mesh = meshes[i];
+		_writer.add_deferred_string(mesh->name);
+
+		// we save the vertex data in a deferred segment, because
+		// once the buffers have been created we're free to throw
+		// the data away
+		_writer.write((int)mesh->sub_meshes.size());
+		for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
+			SubMesh *sub = mesh->sub_meshes[j];
+			_writer.add_deferred_string(sub->material);
+
+			void *vb, *ib;
+			int vb_len, ib_len, index_size;
+			compact_vertex_data(*sub, &vb, &vb_len);
+			compact_index_data(*sub, &ib, &ib_len, &index_size);
+
+			_writer.write(sub->vertex_flags);
+			_writer.write(sub->element_size);
+			_writer.write(index_size);
+			_writer.add_deferred_binary(vb, vb_len);
+			_writer.add_deferred_binary(ib, ib_len);
+		}
+	}
+
 	return true;
 }
 
@@ -552,15 +669,17 @@ bool FbxConverter::save_materials() {
 
 	BlockHeader header;
 	header.id = BlockId::kMaterials;
-	_writer.push_pos();
-	_writer.write(header);
-	int block_start = _writer.pos();
+	ScopedBlock scoped_block(header, _writer);
 
-	_writer.write((int)_scene.materials.size());
-	for (Scene::Materials::iterator it = _scene.materials.begin(); it != _scene.materials.end(); ++it) {
+	Scene::Materials &materials = _scene.materials;
+
+	_writer.write((int)materials.size());
+	for (Scene::Materials::iterator it = materials.begin(); it != materials.end(); ++it) {
 		const Material *mat = it->second;
 		_writer.add_deferred_string(mat->name);
 		_writer.write((int)mat->properties.size());
+
+		// write the properties for the material
 		for (size_t i = 0; i < mat->properties.size(); ++i) {
 			const MaterialProperty &prop = mat->properties[i];
 			_writer.add_deferred_string(prop.name);
@@ -580,10 +699,6 @@ bool FbxConverter::save_materials() {
 
 	}
 
-	header.size = _writer.pos() - block_start;
-	_writer.push_exch();
-	_writer.write(header);
-	_writer.pop_pos();
 
 	return true;
 }
@@ -628,4 +743,3 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	return 0;
 }
-
