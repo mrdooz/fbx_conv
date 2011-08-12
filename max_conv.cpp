@@ -7,13 +7,15 @@ using namespace std;
 #if _DEBUG
 #pragma comment(lib, "fbxsdk-2012.1-mdd.lib")
 #else
-#pragma comment(lib, "fbxsdk-2012.1.lib")
+#pragma comment(lib, "fbxsdk-2012.1-md.lib")
 #endif
 
 #pragma pack(push, 1)
 struct MainHeader {
 	int material_ofs;
 	int mesh_ofs;
+	int light_ofs;
+	int camera_ofs;
 	int string_ofs;
 	int binary_ofs;
 	int total_size;
@@ -22,7 +24,9 @@ struct MainHeader {
 namespace BlockId {
 	enum Enum {
 		kMaterials,
-		kMeshes
+		kMeshes,
+		kCameras,
+		kLights,
 	};
 }
 
@@ -133,7 +137,7 @@ public:
 	}
 
 	template <class T>
-	void write(const T& data) {
+	void write(const T& data) const {
 		fwrite(&data, 1, sizeof(T), _f);
 	}
 
@@ -196,20 +200,24 @@ struct ScopedBlock {
 	int block_start;
 };
 
-enum ParamType {
-	kInt = 1,
-	kFloat,
-	kFloat2,
-	kFloat3,
-	kFloat4
-};
+namespace Property {
+	enum Type {
+		kUnknown,
+		kFloat,
+		kFloat2,
+		kFloat3,
+		kFloat4,
+		kFloat4x4,
+		kInt,
+	};
+}
 
 struct MaterialProperty {
-	MaterialProperty(const string &name, int value) : name(name), type(kInt), _int(value) {}
-	MaterialProperty(const string &name, fbxDouble1 value) : name(name), type(kFloat) { _float[0] = (float)value; }
-	MaterialProperty(const string &name, fbxDouble4 value) : name(name), type(kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
+	MaterialProperty(const string &name, int value) : name(name), type(Property::kInt), _int(value) {}
+	MaterialProperty(const string &name, fbxDouble1 value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
+	MaterialProperty(const string &name, fbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
 	string name;
-	ParamType type;
+	Property::Type type;
 	union {
 		int _int;
 		float _float[4];
@@ -219,6 +227,7 @@ struct MaterialProperty {
 struct Material {
 	Material(const string &name) : name(name) {}
 	string name;
+	string technique;
 	vector<MaterialProperty> properties;
 };
 
@@ -256,6 +265,14 @@ struct SuperVertex {
 		return false;
 	}
 };
+
+fbxDouble4 max_to_dx(const fbxDouble4 &m) {
+	return fbxDouble4(m[0], m[2], m[1], m[3]);
+}
+
+fbxDouble3 max_to_dx(const fbxDouble3 &m) {
+	return fbxDouble3(m[0], m[2], m[1]);
+}
 
 struct Vector2 {
 	Vector2() {}
@@ -324,8 +341,9 @@ void compact_vertex_data(const SubMesh &submesh, void **data, int *len) {
 
 void compact_index_data(const SubMesh &submesh, void **data, int *len, int *index_size) {
 	// check if we need 16 or 32 bit indices
-	const size_t elems = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
-	const bool need_32_bit = elems >= (1 << 16);
+	const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
+	const size_t elems = submesh.indices.size();
+	const bool need_32_bit = num_verts >= (1 << 16);
 	*index_size = need_32_bit ? 4 : 2;
 	*len = elems * (*index_size);
 	void *buf = new char[*len];
@@ -354,11 +372,31 @@ struct Mesh {
 
 
 struct Camera {
-
+	string name;
+	fbxDouble3 pos, up, look_at;
+	fbxDouble1 roll;
 };
 
 struct Light {
+	enum Type {
+		Omni,
+		Directional,
+		Spot
+	};
 
+	enum Decay {
+		None,
+		Linear,
+		Quadratic,
+		Cubic,
+	};
+
+	string name;
+	Type type;
+	Decay decay;
+	fbxDouble3 pos;
+	fbxDouble3 color;
+	fbxDouble1 intensity;
 };
 
 struct Hierarchy {
@@ -373,11 +411,17 @@ struct Scene {
 	~Scene() {
 		assoc_delete(&materials);
 		seq_delete(&meshes);
+		seq_delete(&lights);
+		seq_delete(&cameras);
 	}
 
 	typedef map<string, Material *> Materials;
 	typedef vector<Mesh *> Meshes;
+	typedef vector<Camera *> Cameras;
+	typedef vector<Light *> Lights;
 
+	Cameras cameras;
+	Lights lights;
 	Materials materials;
 	Meshes meshes;
 };
@@ -389,16 +433,23 @@ public:
 	bool convert(const char *src, const char *dst);
 private:
 
-	bool export_mesh(KFbxNode *node, KFbxMesh *mesh);
-	void traverse_scene(KFbxScene *scene);
+	bool traverse_scene(KFbxScene *scene);
+
+	bool process_mesh(KFbxNode *node, KFbxMesh *mesh);
+	bool process_camera(KFbxNode *node, KFbxCamera *camera);
+	bool process_light(KFbxNode *node, KFbxLight *light);
+
 	bool save_scene(const char *dst);
 	bool save_meshes();
+	bool save_cameras();
+	bool save_lights();
 	bool save_materials();
 
 	vector<string> _errors;
 	Scene _scene;
 	Writer _writer;
 
+	KFbxScene *_fbx_scene;
 	KFbxSdkManager *_mgr;
 	KFbxIOSettings *_settings;
 	KFbxGeometryConverter *_converter;
@@ -425,17 +476,64 @@ bool FbxConverter::convert(const char *src, const char *dst) {
 	if (!res)
 		return false;
 
-	KFbxScene *scene = KFbxScene::Create(_mgr, "my_scene");
-	_importer->Import(scene);
-	traverse_scene(scene);
+	_fbx_scene = KFbxScene::Create(_mgr, "my_scene");
+	_importer->Import(_fbx_scene);
+
+	KFbxAxisSystem &axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
+	int up_sign, front_sign;
+	KFbxAxisSystem::eUpVector up = axis.GetUpVector(up_sign);
+	KFbxAxisSystem::eFrontVector front = axis.GetFrontVector(front_sign);
+	KFbxAxisSystem::eCoorSystem handed = axis.GetCoorSystem();
+
+	// check that the scene is exported with a 3ds-max compliant coordinate system
+	KFbxAxisSystem max_system(KFbxAxisSystem::eMax);
+	if (max_system != axis) {
+		printf("Unsupported coordinate system.");
+		return false;
+	}
+
+	traverse_scene(_fbx_scene);
 	save_scene(dst);
 
-	scene->Destroy();
+	_fbx_scene->Destroy();
+	_fbx_scene = NULL;
 
 	return true;
 }
 
-bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
+bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
+
+	if (!light->CastLight.Get())
+		return true;
+
+	KFbxAnimEvaluator *evaluator = _fbx_scene->GetEvaluator();
+
+	Light *l = new Light;
+	l->name = node->GetName();
+	KFbxMatrix mtx = evaluator->GetNodeGlobalTransform(node);
+	l->pos = max_to_dx(fbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
+	l->color = light->Color.Get();
+
+	_scene.lights.push_back(l);
+
+	return true;
+}
+
+bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
+
+	Camera *c = new Camera;
+	c->name = node->GetName();
+	c->pos = max_to_dx(camera->Position.Get());
+	c->up = max_to_dx(camera->UpVector.Get());
+	c->look_at = max_to_dx(camera->InterestPosition.Get());
+	c->roll = camera->Roll.Get();
+
+	_scene.cameras.push_back(c);
+
+	return true;
+}
+
+bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
 	int material_count = fbx_node->GetMaterialCount();
 	for (int i = 0; i < material_count; ++i) {
@@ -448,6 +546,8 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
 		Material *material = new Material(name);
 		_scene.materials.insert(make_pair(name, material));
+
+		material->technique = "diffuse";
 
 #define PROP(name, type) KFbxSurfaceMaterial::name, KFbxGet<type>(node_material->FindProperty(KFbxSurfaceMaterial::name))
 		material->properties.push_back(MaterialProperty(PROP(sEmissive, fbxDouble4)));
@@ -517,19 +617,23 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 			const int poly_idx = indices[j];
 			CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
-			// create a supervertex for the current vertex, and check if it already exists to
-			// determine what vertex index to give it
-			for (int k = 0; k < 3; ++k) {
-				KFbxVector4 normal;
-				KFbxVector4 pos = fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k));
-				SuperVertex cand(pos, normal);
+			// we reverse the winding order to convert between the right and left-handed systems
+			KFbxVector4 pos, normal;
+			for (int k = 2; k >= 0; --k) {
+				pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
 				fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
+				pos = max_to_dx(pos);
+				normal = max_to_dx(normal);
+
+				SuperVertex cand(pos, normal);
 				for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
 					KFbxVector2 uv;
 					fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
 					cand.uv.push_back(uv);
 				}
 
+				// create a supervertex for the current vertex, and check if it already exists to
+				// determine what vertex index to give it
 				int idx = -1;
 				set<SuperVertex>::iterator it = super_verts.find(cand);
 				if (it == super_verts.end()) {
@@ -552,48 +656,55 @@ bool FbxConverter::export_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 }
 
 
-void FbxConverter::traverse_scene(KFbxScene *scene) {
+bool FbxConverter::traverse_scene(KFbxScene *scene) {
 
 	if (KFbxNode *root = scene->GetRootNode()) {
 		for (int i = 0; i < root->GetChildCount(); ++i) {
 			KFbxNode *child = root->GetChild(i);
-			KFbxNodeAttribute *cur = child->GetNodeAttribute();
-			if (!cur)
+			KFbxNodeAttribute *node_attr = child->GetNodeAttribute();
+			if (!node_attr)
 				continue;
-			switch (cur->GetAttributeType()) {
-			case KFbxNodeAttribute::eMARKER:
-				break;
 
-			case KFbxNodeAttribute::eSKELETON:
-				break;
+			switch (node_attr->GetAttributeType()) {
+				case KFbxNodeAttribute::eMARKER:
+					break;
 
-			case KFbxNodeAttribute::eMESH:
-				{
-					KFbxMesh *triangulated = _converter->TriangulateMesh((KFbxMesh *)cur);
-					if (!export_mesh(child, triangulated)) {
-						// report error
+				case KFbxNodeAttribute::eSKELETON:
+					break;
+
+				case KFbxNodeAttribute::eMESH:
+					{
+						KFbxMesh *triangulated = _converter->TriangulateMesh((KFbxMesh *)node_attr);
+						bool res = process_mesh(child, triangulated);
+						triangulated->Destroy();
+						if (!res)
+							return false;
 					}
-					triangulated->Destroy();
-				}
-				break;
+					break;
 
-			case KFbxNodeAttribute::eNURB:
-				break;
+				case KFbxNodeAttribute::eNURB:
+					break;
 
-			case KFbxNodeAttribute::ePATCH:
-				break;
+				case KFbxNodeAttribute::ePATCH:
+					break;
 
-			case KFbxNodeAttribute::eCAMERA:
-				break;
+				case KFbxNodeAttribute::eCAMERA:
+						if (!process_camera(child, (KFbxCamera *)node_attr))
+							return false;
+					break;
 
-			case KFbxNodeAttribute::eLIGHT:
-				break;
+				case KFbxNodeAttribute::eLIGHT:
+					if (!process_light(child, (KFbxLight *)node_attr))
+						return false;
+					break;
 
-			case KFbxNodeAttribute::eLODGROUP:
-				break;
-			}   
+				case KFbxNodeAttribute::eLODGROUP:
+					break;
+				}   
 		}
 	}
+
+	return true;
 }
 
 bool FbxConverter::save_scene(const char *dst) {
@@ -615,6 +726,14 @@ bool FbxConverter::save_scene(const char *dst) {
 	if (!save_meshes())
 		return false;
 
+	header.light_ofs = _writer.pos();
+	if (!save_lights())
+		return false;
+
+	header.camera_ofs = _writer.pos();
+	if (!save_cameras())
+		return false;
+
 	header.string_ofs = _writer.pos();
 	_writer.save_strings();
 
@@ -625,6 +744,56 @@ bool FbxConverter::save_scene(const char *dst) {
 	_writer.push_exch();
 	_writer.write(header);
 	_writer.pop_pos();
+
+	return true;
+}
+
+template <class T>
+void write_vector(const Writer &writer, const T &v) {
+	static_assert(sizeof(T) >= 3 * sizeof(fbxDouble1), "Vector must have at least 3 elements");
+	writer.write((float)v[0]);
+	writer.write((float)v[1]);
+	writer.write((float)v[2]);
+}
+
+bool FbxConverter::save_cameras() {
+
+	BlockHeader header;
+	header.id = BlockId::kCameras;
+	ScopedBlock scoped_block(header, _writer);
+
+	Scene::Cameras &cameras = _scene.cameras;
+
+	_writer.write((int)cameras.size());
+	for (size_t i = 0; i < cameras.size(); ++i) {
+		Camera *camera = cameras[i];
+		_writer.add_deferred_string(camera->name);
+		write_vector(_writer, camera->pos);
+		write_vector(_writer, camera->up);
+		write_vector(_writer, camera->look_at);
+		_writer.write((float)camera->roll);
+	};
+
+	return true;
+}
+
+bool FbxConverter::save_lights() {
+
+	BlockHeader header;
+	header.id = BlockId::kLights;
+	ScopedBlock scoped_block(header, _writer);
+
+	Scene::Lights &lights = _scene.lights;
+
+	_writer.write((int)lights.size());
+	for (size_t i = 0; i < lights.size(); ++i) {
+		Light *light = lights[i];
+		_writer.add_deferred_string(light->name);
+		write_vector(_writer, light->pos);
+		write_vector(_writer, light->color);
+		_writer.write((float)light->intensity);
+
+	}
 
 	return true;
 }
@@ -678,6 +847,7 @@ bool FbxConverter::save_materials() {
 	for (Scene::Materials::iterator it = materials.begin(); it != materials.end(); ++it) {
 		const Material *mat = it->second;
 		_writer.add_deferred_string(mat->name);
+		_writer.add_deferred_string(mat->technique);
 		_writer.write((int)mat->properties.size());
 
 		// write the properties for the material
@@ -686,13 +856,13 @@ bool FbxConverter::save_materials() {
 			_writer.add_deferred_string(prop.name);
 			_writer.write(prop.type);
 			switch (prop.type) {
-			case kInt:
+			case Property::kInt:
 				_writer.write(prop._int);
 				break;
-			case kFloat:
+			case Property::kFloat:
 				_writer.write_raw(&prop._float[0], sizeof(float));
 				break;
-			case kFloat4:
+			case Property::kFloat4:
 				_writer.write_raw(&prop._float[0], 4 * sizeof(float));
 				break;
 			}
@@ -704,43 +874,19 @@ bool FbxConverter::save_materials() {
 	return true;
 }
 
-void test_load(const char *filename) {
-	FILE *f = fopen(filename, "rb");
-	fseek(f, 0, SEEK_END);
-	int len = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	char *buf = new char[len];
-	fread(buf, 1, len, f);
-	MainHeader *header = (MainHeader *)buf;
-
-	int *pp = (int *)(buf + header->string_ofs);
-	int count = *pp++;
-	for (int i = 0; i < count; ++i) {
-		int *ofs = (int *)(buf + pp[i]);
-		*ofs += (int)buf;
-		const char *tmp = (const char *)*ofs;
-		int a = 10;
-	}
-
-	delete [] buf;
-
-	fclose(f);
-
-}
-
 int _tmain(int argc, _TCHAR* argv[])
 {
 
-	const char *dst = "c:\\temp\\torus.kumi";
+#define OBJ "torus"
+
+	const char *dst = "c:\\temp\\" OBJ ".kumi";
 
 	FbxConverter converter;
-	if (!converter.convert("C:\\Users\\dooz\\Documents\\3dsMax\\export\\torus.fbx", dst)) {
-		if (!converter.convert("C:\\Users\\dooz\\Dropbox\\export\\torus.fbx", dst)) {
+	if (!converter.convert("C:\\Users\\dooz\\Documents\\3dsMax\\export\\" OBJ ".fbx", dst)) {
+		if (!converter.convert("C:\\Users\\dooz\\Dropbox\\export\\" OBJ ".fbx", dst)) {
 			return 1;
 		}
 	}
-
-	test_load(dst);
 
 	return 0;
 }
