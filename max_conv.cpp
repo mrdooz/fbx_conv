@@ -373,7 +373,7 @@ struct Mesh {
 
 struct Camera {
 	string name;
-	fbxDouble3 pos, up, look_at;
+	fbxDouble3 pos, target, up;
 	fbxDouble1 roll;
 };
 
@@ -521,11 +521,16 @@ bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
 
 bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 
+	KFbxCamera::ECameraAspectRatioMode aspect_ratio_mode = camera->AspectRatioMode.Get();
+	double r = camera->GetPixelRatio();
+	double w = camera->AspectWidth.Get();
+	double h = camera->AspectHeight.Get();
+
 	Camera *c = new Camera;
 	c->name = node->GetName();
 	c->pos = max_to_dx(camera->Position.Get());
+	c->target = max_to_dx(camera->InterestPosition.Get());
 	c->up = max_to_dx(camera->UpVector.Get());
-	c->look_at = max_to_dx(camera->InterestPosition.Get());
 	c->roll = camera->Roll.Get();
 
 	_scene.cameras.push_back(c);
@@ -582,13 +587,21 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 	for (int i = 0; i < material_count; ++i)
 		polys_by_material.push_back(vector<int>());
 
+	bool use_default_material = false;
 	{
-		const KFbxLayerElementMaterial *materials = layer->GetMaterials();
-		KFbxLayerElement::EMappingMode mm = materials->GetMappingMode();
-		CHECK_FATAL(mm == KFbxLayerElement::eBY_POLYGON, "Unsupported mapping mode");
-		const KFbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
-		for (int i = 0; i < arr.GetCount(); ++i) {
-			polys_by_material[arr[i]].push_back(i);
+		if (const KFbxLayerElementMaterial *materials = layer->GetMaterials()) {
+			KFbxLayerElement::EMappingMode mm = materials->GetMappingMode();
+			CHECK_FATAL(mm == KFbxLayerElement::eBY_POLYGON, "Unsupported mapping mode");
+			const KFbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
+			for (int i = 0; i < arr.GetCount(); ++i) {
+				polys_by_material[arr[i]].push_back(i);
+			}
+		} else {
+			// no materials found, so use default material
+			use_default_material = true;
+			polys_by_material.push_back(PolyIndices());
+			for (int i = 0; i < fbx_mesh->GetPolygonCount(); ++i)
+				polys_by_material[0].push_back(i);
 		}
 	}
 
@@ -609,7 +622,7 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 		// keep track of the unique vertices
 		set<SuperVertex> super_verts;
 
-		SubMesh *sub_mesh = new SubMesh(fbx_node->GetMaterial(i)->GetName(), vertex_flags);
+		SubMesh *sub_mesh = new SubMesh(use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName(), vertex_flags);
 		mesh->sub_meshes.push_back(sub_mesh);
 
 		const PolyIndices &indices = polys_by_material[i];
@@ -769,8 +782,8 @@ bool FbxConverter::save_cameras() {
 		Camera *camera = cameras[i];
 		_writer.add_deferred_string(camera->name);
 		write_vector(_writer, camera->pos);
+		write_vector(_writer, camera->target);
 		write_vector(_writer, camera->up);
-		write_vector(_writer, camera->look_at);
 		_writer.write((float)camera->roll);
 	};
 
