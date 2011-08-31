@@ -540,6 +540,9 @@ bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 
 bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
+	fbx_mesh->SetPivot(fbx_node->EvaluateGlobalTransform());
+	fbx_mesh->ApplyPivot();
+
 	int material_count = fbx_node->GetMaterialCount();
 	for (int i = 0; i < material_count; ++i) {
 		KFbxSurfaceMaterial *node_material = fbx_node->GetMaterial(i);
@@ -610,7 +613,7 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 	for (int i = 0; i < layer->GetUVSetCount(); ++i)
 		uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
-	Mesh *mesh = new Mesh(fbx_mesh->GetName());
+	Mesh *mesh = new Mesh(fbx_node->GetName());
 	_scene.meshes.push_back(mesh);
 
 	uint32_t vertex_flags = SubMesh::kPos | SubMesh::kNormal;
@@ -635,7 +638,6 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 			for (int k = 2; k >= 0; --k) {
 				pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
 				fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
-				pos = max_to_dx(pos);
 				normal = max_to_dx(normal);
 
 				SuperVertex cand(pos, normal);
