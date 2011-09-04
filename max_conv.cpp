@@ -1,4 +1,6 @@
 #include "stdafx.h"
+#include <d3d11.h>
+#include <D3DX10math.h>
 
 using namespace std;
 
@@ -9,6 +11,8 @@ using namespace std;
 #else
 #pragma comment(lib, "fbxsdk-2012.1-md.lib")
 #endif
+
+#pragma comment(lib, "d3dx10.lib")
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -266,8 +270,8 @@ struct SuperVertex {
 	}
 };
 
-fbxDouble4 max_to_dx(const fbxDouble4 &m) {
-	return fbxDouble4(m[0], m[2], m[1], m[3]);
+fbxDouble4 max_to_dx(const fbxDouble4 &m, bool neg_w = false) {
+	return fbxDouble4(m[0], m[2], m[1], (neg_w ? -1 : 1) * m[3]);
 }
 
 fbxDouble3 max_to_dx(const fbxDouble3 &m) {
@@ -367,6 +371,7 @@ struct Mesh {
 		seq_delete(&sub_meshes);
 	}
 	string name;
+	D3DXMATRIX obj_to_world;
 	vector<SubMesh *> sub_meshes;
 };
 
@@ -375,6 +380,9 @@ struct Camera {
 	string name;
 	fbxDouble3 pos, target, up;
 	fbxDouble1 roll;
+	fbxDouble1 aspect_ratio;
+	fbxDouble1 fov;
+	fbxDouble1 near_plane, far_plane;
 };
 
 struct Light {
@@ -521,10 +529,11 @@ bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
 
 bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 
-	KFbxCamera::ECameraAspectRatioMode aspect_ratio_mode = camera->AspectRatioMode.Get();
-	double r = camera->GetPixelRatio();
-	double w = camera->AspectWidth.Get();
-	double h = camera->AspectHeight.Get();
+	KFbxCamera::ECameraApertureMode mode = camera->GetApertureMode();
+	double w = camera->GetApertureWidth();
+	double h = camera->GetApertureHeight();
+
+	KFbxCamera::ECameraAspectRatioMode ar_mode = camera->GetAspectRatioMode();
 
 	Camera *c = new Camera;
 	c->name = node->GetName();
@@ -532,6 +541,11 @@ bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 	c->target = max_to_dx(camera->InterestPosition.Get());
 	c->up = max_to_dx(camera->UpVector.Get());
 	c->roll = camera->Roll.Get();
+	c->aspect_ratio = camera->GetApertureWidth() / camera->GetApertureHeight();
+	// convert the horizontal fov to vertical fov
+	c->fov = camera->FieldOfView.Get() / c->aspect_ratio;
+	c->near_plane = camera->NearPlane.Get();
+	c->far_plane = camera->FarPlane.Get();
 
 	_scene.cameras.push_back(c);
 
@@ -539,9 +553,6 @@ bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 }
 
 bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
-
-	fbx_mesh->SetPivot(fbx_node->EvaluateGlobalTransform());
-	fbx_mesh->ApplyPivot();
 
 	int material_count = fbx_node->GetMaterialCount();
 	for (int i = 0; i < material_count; ++i) {
@@ -615,6 +626,18 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
 	Mesh *mesh = new Mesh(fbx_node->GetName());
 	_scene.meshes.push_back(mesh);
+
+	KFbxXMatrix mtx = fbx_node->EvaluateGlobalTransform();
+	fbxDouble4 s = max_to_dx(mtx.GetS());
+	fbxDouble4 q = max_to_dx(mtx.GetQ(), true);
+	fbxDouble4 t = max_to_dx(mtx.GetT());
+
+	D3DXMATRIX mtx_s, mtx_r, mtx_t;
+
+	mesh->obj_to_world = 
+		*D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
+		*D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
+		*D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
 
 	uint32_t vertex_flags = SubMesh::kPos | SubMesh::kNormal;
 	vertex_flags |= uv_sets.size() == 2 ? SubMesh::kTex1 | SubMesh::kTex0 : uv_sets.size() == 1 ? SubMesh::kTex0 : 0;
@@ -763,9 +786,13 @@ bool FbxConverter::save_scene(const char *dst) {
 	return true;
 }
 
-template <class T>
-void write_vector(const Writer &writer, const T &v) {
-	static_assert(sizeof(T) >= 3 * sizeof(fbxDouble1), "Vector must have at least 3 elements");
+void write_vector(const Writer &writer, const fbxDouble3 &v) {
+	writer.write((float)v[0]);
+	writer.write((float)v[1]);
+	writer.write((float)v[2]);
+}
+
+void write_vector(const Writer &writer, const fbxDouble4 &v) {
 	writer.write((float)v[0]);
 	writer.write((float)v[1]);
 	writer.write((float)v[2]);
@@ -787,6 +814,10 @@ bool FbxConverter::save_cameras() {
 		write_vector(_writer, camera->target);
 		write_vector(_writer, camera->up);
 		_writer.write((float)camera->roll);
+		_writer.write((float)camera->aspect_ratio);
+		_writer.write((float)camera->fov);
+		_writer.write((float)camera->near_plane);
+		_writer.write((float)camera->far_plane);
 	};
 
 	return true;
@@ -825,6 +856,7 @@ bool FbxConverter::save_meshes() {
 	for (size_t i = 0; i < meshes.size(); ++i) {
 		Mesh *mesh = meshes[i];
 		_writer.add_deferred_string(mesh->name);
+		_writer.write(mesh->obj_to_world);
 
 		// we save the vertex data in a deferred segment, because
 		// once the buffers have been created we're free to throw
