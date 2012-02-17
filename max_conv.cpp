@@ -4,6 +4,8 @@
 
 using namespace std;
 
+bool g_verbose = false;
+
 #define SAFE_DELETE(x) if( (x) != 0 ) { delete (x); (x) = 0; }
 
 #if _DEBUG
@@ -112,9 +114,10 @@ public:
 			// for each deferred string, save the string, and update the
 			// inplace offset to point to it
 			int p = pos();
-			write_raw(_deferred_strings[i].str.c_str(), _deferred_strings[i].str.size() + 1);
+			DeferredString &str = _deferred_strings[i];
+			write_raw(str.str.c_str(), str.str.size() + 1);
 			push_pos();
-			set_pos(_deferred_strings[i].ofs);
+			set_pos(str.ofs);
 			write(p);
 			pop_pos();
 		}
@@ -439,6 +442,7 @@ public:
 	FbxConverter();
 	~FbxConverter();
 	bool convert(const char *src, const char *dst);
+	const vector<string> &errors() const { return _errors; }
 private:
 
 	bool traverse_scene(KFbxScene *scene);
@@ -476,7 +480,20 @@ FbxConverter::~FbxConverter() {
 
 }
 
-#define CHECK_FATAL(x, msg) if (!(x)) {_errors.push_back(__FUNCTION__ + string(": ") + string(msg)); return false; }
+string to_string(const char *format, ...)
+{
+	string res;
+	va_list arg;
+	va_start(arg, format);
+	int len = _vscprintf(format, arg);
+	char *buf = (char *)_alloca(len + 1);
+	vsprintf_s(buf, len + 1, format, arg);
+	va_end(arg);
+	return string(buf);
+}
+
+
+#define CHECK_FATAL(x, msg, ...) if (!(x)) {_errors.push_back(string("!! ") + __FUNCTION__ + string(": ") + to_string(msg, __VA_ARGS__)); return false; }
 
 bool FbxConverter::convert(const char *src, const char *dst) {
 
@@ -524,6 +541,10 @@ bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
 
 	_scene.lights.push_back(l);
 
+	if (g_verbose) {
+		printf("# found light: %s\n", l->name.c_str());
+	}
+
 	return true;
 }
 
@@ -549,6 +570,10 @@ bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
 
 	_scene.cameras.push_back(c);
 
+	if (g_verbose) {
+		printf("# found camera: %s\n", c->name.c_str());
+	}
+
 	return true;
 }
 
@@ -562,6 +587,10 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 		// Skip if we've already seen this material
 		if (_scene.materials.find(name) != _scene.materials.end())
 			continue;
+
+		if (g_verbose) {
+			printf("# found material: %s\n", name);
+		}
 
 		Material *material = new Material(name);
 		_scene.materials.insert(make_pair(name, material));
@@ -605,7 +634,9 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 	{
 		if (const KFbxLayerElementMaterial *materials = layer->GetMaterials()) {
 			KFbxLayerElement::EMappingMode mm = materials->GetMappingMode();
-			CHECK_FATAL(mm == KFbxLayerElement::eBY_POLYGON, "Unsupported mapping mode");
+			// I don't care about mapping modes atm, and the check_fatal condition seems a bit fishy anyway..
+			//static const char *mm_str[] = { "eNONE", "eBY_CONTROL_POINT", "eBY_POLYGON_VERTEX", "eBY_POLYGON", "eBY_EDGE", "eALL_SAME" };
+			//CHECK_FATAL(mm == KFbxLayerElement::eBY_POLYGON, "Unsupported mapping mode: %s", mm <= KFbxLayerElement::eALL_SAME ? mm_str[mm] : "unknown");
 			const KFbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
 			for (int i = 0; i < arr.GetCount(); ++i) {
 				polys_by_material[arr[i]].push_back(i);
@@ -631,6 +662,10 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 	fbxDouble4 s = max_to_dx(mtx.GetS());
 	fbxDouble4 q = max_to_dx(mtx.GetQ(), true);
 	fbxDouble4 t = max_to_dx(mtx.GetT());
+
+	if (g_verbose) {
+		printf("# found mesh: %s (%zu submeshes)\n", mesh->name.c_str(), polys_by_material.size());
+	}
 
 	D3DXMATRIX mtx_s, mtx_r, mtx_t;
 
@@ -924,15 +959,22 @@ bool FbxConverter::save_materials() {
 int _tmain(int argc, _TCHAR* argv[])
 {
 
-#define OBJ "torus"
+	if (argc < 2) {
+		printf("syntax: %s src dst", argv[0]);
+		return 1;
+	}
 
-	const char *dst = "c:\\temp\\" OBJ ".kumi";
+	if (argc == 4) {
+		g_verbose = !strcmp(argv[1], "--verbose");
+		argv++;
+	}
 
 	FbxConverter converter;
-	if (!converter.convert("C:\\Users\\dooz\\Documents\\3dsMax\\export\\" OBJ ".fbx", dst)) {
-		if (!converter.convert("C:\\Users\\dooz\\Dropbox\\export\\" OBJ ".fbx", dst)) {
-			return 1;
-		}
+	if (!converter.convert(argv[1], argv[2]))
+		return 1;
+
+	for (auto it = begin(converter.errors()); it != end(converter.errors()); ++it) {
+		printf("%s\n", it->c_str());
 	}
 
 	return 0;
