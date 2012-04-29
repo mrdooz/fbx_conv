@@ -5,6 +5,10 @@
 #include <D3DX10math.h>
 #include <algorithm>
 #include <iterator>
+#include <iostream>
+#include <sstream>
+#include <boost/algorithm/string.hpp>
+#include <io.h>
 
 typedef uint16_t uint16;
 typedef uint32_t uint32;
@@ -12,9 +16,25 @@ typedef uint32_t uint32;
 using namespace std;
 using namespace stdext;
 
-bool g_verbose = false;
+class FbxConverter;
+
+bool g_verbose;
+bool g_file_watch;
+FbxConverter *g_converter;
+string g_src_path;
+string g_src, g_dst;
+HWND g_hwnd;
+HANDLE g_dir;
+HANDLE g_quit_event;
+
+const int WM_USER_CONVERT_FILE = WM_USER + 1;
+const int FILE_CHANGED_TIMER_ID = 1;
 
 #define SAFE_DELETE(x) if( (x) != 0 ) { delete (x); (x) = 0; }
+
+#define GEN_NAME2(prefix, line) prefix##line
+#define GEN_NAME(prefix, line) GEN_NAME2(prefix, line)
+#define MAKE_SCOPED(type) type GEN_NAME(ANON, __COUNTER__)
 
 #if _DEBUG
 #pragma comment(lib, "fbxsdk-2013.1-mdd.lib")
@@ -230,6 +250,7 @@ namespace Property {
 struct MaterialProperty {
   MaterialProperty(const string &name, int value) : name(name), type(Property::kInt), _int(value) {}
   MaterialProperty(const string &name, FbxDouble value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
+  MaterialProperty(const string &name, FbxDouble3 value) : name(name), type(Property::kFloat3) { for (int i = 0; i < 3; ++i) _float[i] = (float)value[i]; _float[3] = 0; }
   MaterialProperty(const string &name, FbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
   string name;
   Property::Type type;
@@ -443,12 +464,14 @@ public:
   FbxConverter();
   ~FbxConverter();
   bool convert(const char *src, const char *dst);
-  const vector<string> &errors() const { return _errors; }
 private:
+
+  bool convert_inner(const char *src, const char *dst);
 
   bool traverse_scene(FbxScene *scene);
 
   bool process_mesh(FbxNode *node, FbxMesh *mesh);
+  bool process_material(FbxNode *node, int *material_count);
   bool process_camera(FbxNode *node, FbxCamera *camera);
   bool process_light(FbxNode *node, FbxLight *light);
 
@@ -457,6 +480,24 @@ private:
   bool save_cameras();
   bool save_lights();
   bool save_materials();
+
+  void add_error(const char *fmt, ...);
+  void add_info(const char *fmt, ...);
+
+  static const int cIndentLevel = 4;
+  static const int cMaxIndent = 512;
+  void enter_scope() { _indent_level += cIndentLevel; }
+  void leave_scope() { _indent_level -= cIndentLevel; }
+
+  struct InfoScope {
+    InfoScope() { g_converter->enter_scope(); }
+    ~InfoScope() { g_converter->leave_scope(); }
+  };
+
+#define INFO_SCOPE MAKE_SCOPED(InfoScope);
+
+  int _indent_level;
+  char _indent_buffer[cMaxIndent+1];
 
   vector<string> _errors;
   Scene _scene;
@@ -474,7 +515,10 @@ FbxConverter::FbxConverter()
   , _settings(FbxIOSettings::Create(_mgr, IOSROOT))
   , _converter(new FbxGeometryConverter(_mgr))
   , _importer(FbxImporter::Create(_mgr, ""))
+  , _indent_level(0)
 {
+  memset(_indent_buffer, ' ', cMaxIndent);
+  _indent_buffer[cMaxIndent] = '\0';
 }
 
 FbxConverter::~FbxConverter() {
@@ -496,11 +540,13 @@ string to_string(const char *format, ...)
 
 #define CHECK_FATAL(x, msg, ...) if (!(x)) {_errors.push_back(string("!! ") + __FUNCTION__ + string(": ") + to_string(msg, __VA_ARGS__)); return false; }
 
-bool FbxConverter::convert(const char *src, const char *dst) {
+bool FbxConverter::convert_inner(const char *src, const char *dst) {
 
   bool res = _importer->Initialize(src, -1, _settings);
-  if (!res)
+  if (!res) {
+    _errors.push_back(to_string("Error calling FbxImporter::Initialize: %s", _importer->GetLastErrorString()));
     return false;
+  }
 
   _fbx_scene = FbxScene::Create(_mgr, "my_scene");
   _importer->Import(_fbx_scene);
@@ -514,7 +560,7 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   // check that the scene is exported with a 3ds-max compliant coordinate system
   FbxAxisSystem max_system(FbxAxisSystem::eMax);
   if (max_system != axis) {
-    printf("Unsupported coordinate system.");
+    _errors.push_back("Unsupported coordinate system.");
     return false;
   }
 
@@ -527,7 +573,22 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   return true;
 }
 
+bool FbxConverter::convert(const char *src, const char *dst) {
+
+  add_info("===================================================================");
+  bool res = convert_inner(src, dst);
+
+  copy(begin(_errors), end(_errors), ostream_iterator<string>(cout));
+
+  for (auto it = begin(_errors); it != end(_errors); ++it)
+    printf("%s\n", it->c_str());
+
+  return res;
+}
+
 bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
+
+  INFO_SCOPE;
 
   if (!light->CastLight.Get())
     return true;
@@ -543,13 +604,15 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
   _scene.lights.push_back(l);
 
   if (g_verbose) {
-    printf("# found light: %s\n", l->name.c_str());
+    add_info("found light: %s", l->name.c_str());
   }
 
   return true;
 }
 
 bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
+
+  INFO_SCOPE;
 
   FbxCamera::EApertureMode mode = camera->GetApertureMode();
   double w = camera->GetApertureWidth();
@@ -572,16 +635,16 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   _scene.cameras.push_back(c);
 
   if (g_verbose) {
-    printf("# found camera: %s\n", c->name.c_str());
+    add_info("found camera: %s", c->name.c_str());
   }
 
   return true;
 }
 
-bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
-
-  int material_count = fbx_node->GetMaterialCount();
-  for (int i = 0; i < material_count; ++i) {
+bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
+  INFO_SCOPE;
+  *material_count = fbx_node->GetMaterialCount();
+  for (int i = 0; i < *material_count; ++i) {
     FbxSurfaceMaterial *node_material = fbx_node->GetMaterial(i);
     const char *name = node_material->GetName();
 
@@ -590,7 +653,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       continue;
 
     if (g_verbose) {
-      printf("# found material: %s\n", name);
+      add_info("found material: %s", name);
     }
 
     Material *material = new Material(name);
@@ -598,29 +661,49 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
     material->technique = "diffuse";
 
-//#define PROP(name, type) FbxSurfaceMaterial::name, FbxSurfaceMaterial::Get<type>(node_material->FindProperty(FbxSurfaceMaterial::name))
-#define PROP(name, type) #name, FbxSurfaceMaterial::Get<type>(node_material->FindProperty(FbxSurfaceMaterial::name))
-/*
-    material->properties.push_back(MaterialProperty(PROP(sEmissive, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sEmissiveFactor, FbxDouble)));
+#define ADD_PROP(name, mat) material->properties.push_back(MaterialProperty(#name, mat->name))
 
-    material->properties.push_back(MaterialProperty(PROP(sAmbient, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sAmbientFactor, FbxDouble)));
+    bool is_phong = node_material->GetClassId().Is(FbxSurfacePhong::ClassId);
+    bool is_lambert = node_material->GetClassId().Is(FbxSurfaceLambert::ClassId);
 
-    material->properties.push_back(MaterialProperty(PROP(sDiffuse, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sDiffuseFactor, FbxDouble)));
+    if (is_lambert || is_phong) {
+      FbxSurfaceLambert *mat = (FbxSurfaceLambert *)node_material;
+      ADD_PROP(Ambient, mat);
+      ADD_PROP(AmbientFactor, mat);
+      ADD_PROP(Diffuse, mat);
+      ADD_PROP(DiffuseFactor, mat);
+      ADD_PROP(Emissive, mat);
+      ADD_PROP(EmissiveFactor, mat);
+      ADD_PROP(TransparentColor, mat);
+      ADD_PROP(TransparencyFactor, mat);
 
-    material->properties.push_back(MaterialProperty(PROP(sSpecular, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sSpecularFactor, FbxDouble)));
-    material->properties.push_back(MaterialProperty(PROP(sShininess, FbxDouble)));
+      if (is_phong) {
+        FbxSurfacePhong *mat = (FbxSurfacePhong *)node_material;
+        ADD_PROP(Specular, mat);
+        ADD_PROP(SpecularFactor, mat);
+        ADD_PROP(Shininess, mat);
+        ADD_PROP(Reflection, mat);
+        ADD_PROP(ReflectionFactor, mat);
+      }
+    } else {
+      // unknown material
+      _errors.push_back(to_string("Unknown material type: %s", node_material->GetTypeName()));
+    }
 
-    material->properties.push_back(MaterialProperty(PROP(sTransparentColor, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sTransparencyFactor, FbxDouble)));
+#undef ADD_PROP
+  }
+  return true;
+}
 
-    material->properties.push_back(MaterialProperty(PROP(sReflection, FbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sReflectionFactor, FbxDouble)));
-*/
-#undef PROP
+bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
+
+  INFO_SCOPE;
+
+  add_info("found mesh: %s", fbx_node->GetName());
+
+  int material_count;
+  if (!process_material(fbx_node, &material_count)) {
+    return false;
   }
 
   // just use layer 0.
@@ -673,8 +756,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   FbxDouble4 t = max_to_dx(mtx.GetT());
 
   if (g_verbose) {
-    printf("# found mesh: %s (%Iu submesh%s)\n", mesh->name.c_str(), polys_by_material.size(), 
-      polys_by_material.size() == 1 ? "" : "es");
+    add_info("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
   }
 
   D3DXMATRIX mtx_s, mtx_r, mtx_t;
@@ -876,7 +958,6 @@ bool FbxConverter::save_lights() {
     write_vector(_writer, light->pos);
     write_vector(_writer, light->color);
     _writer.write((float)light->intensity);
-
   }
 
   return true;
@@ -947,38 +1028,214 @@ bool FbxConverter::save_materials() {
       case Property::kFloat:
         _writer.write_raw(&prop._float[0], sizeof(float));
         break;
+      case Property::kFloat3:
+        _writer.write_raw(&prop._float[0], 3 * sizeof(float));
+        break;
       case Property::kFloat4:
         _writer.write_raw(&prop._float[0], 4 * sizeof(float));
         break;
+      default:
+        _errors.push_back("Unknown property type exporting materials");
+        break;
       }
     }
-
   }
-
-
   return true;
 }
 
-int _tmain(int argc, _TCHAR* argv[])
-{
+void FbxConverter::add_error(const char *fmt, ...) {
+
+  va_list arg;
+  va_start(arg, fmt);
+  int len = _vscprintf(fmt, arg);
+  char *buf = (char *)_alloca(len + 1);
+  vsprintf_s(buf, len + 1, fmt, arg);
+  va_end(arg);
+  _errors.push_back(buf);
+}
+
+void FbxConverter::add_info(const char *fmt, ...) {
+
+  va_list arg;
+  va_start(arg, fmt);
+  int len = _vscprintf(fmt, arg);
+  char *buf = (char *)_alloca(len + 1 + _indent_level);
+  vsprintf_s(buf + _indent_level, len + 1, fmt, arg);
+  memset(buf, ' ', _indent_level);
+  va_end(arg);
+  puts(buf);
+}
+
+string wide_char_to_utf8(LPCWSTR str, int len_in_bytes) {
+  char *buf = (char *)_alloca(len_in_bytes) + 1;
+  int len = WideCharToMultiByte(CP_UTF8, 0, str, len_in_bytes / 2, buf, len_in_bytes + 1, NULL, NULL);
+  if (len)
+    buf[len] = '\0';
+  return string(buf);
+}
+
+int parse_cmd_line(LPSTR lpCmdLine) {
+  vector<string> tokens;
+  boost::split(tokens, lpCmdLine, boost::is_any_of("\t "));
+
+  char module_name[MAX_PATH];
+  GetModuleFileName(NULL, module_name, sizeof(module_name));
+
+  int argc = (int)tokens.size();
 
   if (argc < 2) {
-    printf("syntax: %s src dst", argv[0]);
+    printf("syntax: %s [--verbose] [--watch] src dst", module_name);
     return 1;
   }
 
-  if (argc == 4) {
-    g_verbose = !strcmp(argv[1], "--verbose");
-    argv++;
+  for (int i = 0; i < argc - 2; ++i) {
+    g_verbose     |= tokens[i] == "--verbose";
+    g_file_watch  |= tokens[i] == "--watch";
   }
 
-  FbxConverter converter;
-  if (!converter.convert(argv[1], argv[2]))
-    return 1;
+  g_src = tokens[argc-2].c_str();
+  g_dst = tokens[argc-1].c_str();
 
-  for (auto it = begin(converter.errors()); it != end(converter.errors()); ++it) {
-    printf("%s\n", it->c_str());
+  replace(begin(g_src), end(g_src), '\\', '/');
+  replace(begin(g_dst), end(g_dst), '\\', '/');
+
+  return 0;
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+
+int create_msg_window(HINSTANCE instance) {
+
+  static const char* class_name = "DUMMY_CLASS";
+  WNDCLASSEX wx = {};
+  wx.cbSize = sizeof(WNDCLASSEX);
+  wx.lpfnWndProc = WndProc;
+  wx.hInstance = instance;
+  wx.lpszClassName = class_name;
+  if ( RegisterClassEx(&wx) ) {
+    g_hwnd = CreateWindowEx( 0, class_name, "dummy_name", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL );
+    return 0;
+  }
+  return 1;
+}
+
+int create_dir_watch() {
+
+  char drive[_MAX_DRIVE];
+  char dir[_MAX_DIR];
+  char fname[_MAX_FNAME];
+  char ext[_MAX_EXT];
+  _splitpath(g_src.c_str(), drive, dir, fname, ext);
+
+  g_src_path = string(drive) + dir;
+
+  g_dir = CreateFileA(g_src_path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+
+  return 0;
+}
+
+char g_io_buf[4096];
+
+VOID CALLBACK FileIOCompletionRoutine(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped) {
+  if (dwNumberOfBytesTransfered) {
+    FILE_NOTIFY_INFORMATION *info = (FILE_NOTIFY_INFORMATION*)&g_io_buf[0];
+    string filename = wide_char_to_utf8(info->FileName, info->FileNameLength);
+    if (g_src_path + filename == g_src) {
+      // file is modified, so set a timer to convert in 5s
+      SetTimer(g_hwnd, FILE_CHANGED_TIMER_ID, 2000, NULL);
+    }
+  }
+}
+
+DWORD WINAPI WatcherThread(LPVOID param) {
+
+  while (true) {
+    OVERLAPPED overlapped;
+    ZeroMemory(&overlapped, sizeof(overlapped));
+    BOOL res = ReadDirectoryChangesW(g_dir, g_io_buf, sizeof(g_io_buf), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE, NULL, &overlapped, FileIOCompletionRoutine);
+    if (WAIT_OBJECT_0 == WaitForSingleObjectEx(g_quit_event, INFINITE, TRUE)) {
+      break;
+    }
   }
 
   return 0;
 }
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+
+  switch (msg) {
+
+    case WM_TIMER:
+      if (wparam == FILE_CHANGED_TIMER_ID) {
+        PostMessage(hwnd, WM_USER_CONVERT_FILE, 0, 0);
+        return 0;
+      }
+      break;
+
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+
+    case WM_USER_CONVERT_FILE: {
+
+      KillTimer(g_hwnd, FILE_CHANGED_TIMER_ID);
+      g_converter = new FbxConverter();
+      if (!g_converter->convert(g_src.c_str(), g_dst.c_str())) {
+        PostQuitMessage(1);
+      }
+      SAFE_DELETE(g_converter);
+      return 0;
+    }
+
+  }
+
+  return DefWindowProc(hwnd, msg, wparam, lparam);
+}
+
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
+
+  AllocConsole();
+  freopen("CONOUT$","wb",stdout);
+  freopen("CONOUT$","wb",stderr);
+
+  if (parse_cmd_line(lpCmdLine))
+    return 1;
+
+  MSG msg;
+
+  if (g_file_watch) {
+    if (create_msg_window(hInstance))
+      return 1;
+
+    if (create_dir_watch())
+      return 1;
+
+    g_quit_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    DWORD thread_id;
+    HANDLE thread = CreateThread(NULL, 0, WatcherThread, NULL, 0, &thread_id);
+
+    SendMessage(g_hwnd, WM_USER_CONVERT_FILE, 0, 0);
+
+    while(GetMessage(&msg, NULL, 0, 0)) {
+      TranslateMessage(&msg);
+      DispatchMessage(&msg);
+    }
+
+    SetEvent(g_quit_event);
+    WaitForSingleObject(thread, INFINITE);
+
+    CloseHandle(g_hwnd);
+    CloseHandle(g_dir);
+  } else {
+    g_converter = new FbxConverter();
+    msg.wParam = g_converter->convert(g_src.c_str(), g_dst.c_str()) ? 0 : 1;
+    SAFE_DELETE(g_converter);
+  }
+
+  FreeConsole();
+
+  return msg.wParam;
+}
+
