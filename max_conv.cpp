@@ -17,9 +17,9 @@ bool g_verbose = false;
 #define SAFE_DELETE(x) if( (x) != 0 ) { delete (x); (x) = 0; }
 
 #if _DEBUG
-#pragma comment(lib, "fbxsdk-2012.1-mdd.lib")
+#pragma comment(lib, "fbxsdk-2013.1-mdd.lib")
 #else
-#pragma comment(lib, "fbxsdk-2012.1-md.lib")
+#pragma comment(lib, "fbxsdk-2013.1-md.lib")
 #endif
 
 #pragma comment(lib, "d3dx10.lib")
@@ -229,8 +229,8 @@ namespace Property {
 
 struct MaterialProperty {
   MaterialProperty(const string &name, int value) : name(name), type(Property::kInt), _int(value) {}
-  MaterialProperty(const string &name, fbxDouble1 value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
-  MaterialProperty(const string &name, fbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
+  MaterialProperty(const string &name, FbxDouble value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
+  MaterialProperty(const string &name, FbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
   string name;
   Property::Type type;
   union {
@@ -247,10 +247,10 @@ struct Material {
 };
 
 struct SuperVertex {
-  SuperVertex(const KFbxVector4 &pos, const KFbxVector4 &normal) : pos(pos), normal(normal), idx(-1) {}
-  KFbxVector4 pos;
-  KFbxVector4 normal;
-  vector<KFbxVector2> uv;
+  SuperVertex(const FbxVector4 &pos, const FbxVector4 &normal) : pos(pos), normal(normal), idx(-1) {}
+  FbxVector4 pos;
+  FbxVector4 normal;
+  vector<FbxVector2> uv;
   int idx;
 
   friend bool operator<(const SuperVertex &a, const SuperVertex &b) {
@@ -281,23 +281,23 @@ struct SuperVertex {
   }
 };
 
-fbxDouble4 max_to_dx(const fbxDouble4 &m, bool neg_w = false) {
-  return fbxDouble4(m[0], m[2], m[1], (neg_w ? -1 : 1) * m[3]);
+FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
+  return FbxDouble4(m[0], m[2], m[1], (neg_w ? -1 : 1) * m[3]);
 }
 
-fbxDouble3 max_to_dx(const fbxDouble3 &m) {
-  return fbxDouble3(m[0], m[2], m[1]);
+FbxDouble3 max_to_dx(const FbxDouble3 &m) {
+  return FbxDouble3(m[0], m[2], m[1]);
 }
 
 struct Vector2 {
   Vector2() {}
-  Vector2(const KFbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
+  Vector2(const FbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
   float x, y;
 };
 
 struct Vector3 {
   Vector3() {}
-  Vector3(const KFbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
+  Vector3(const FbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
   float x, y, z;
 };
 
@@ -382,11 +382,11 @@ struct Mesh {
 
 struct Camera {
   string name;
-  fbxDouble3 pos, target, up;
-  fbxDouble1 roll;
-  fbxDouble1 aspect_ratio;
-  fbxDouble1 fov;
-  fbxDouble1 near_plane, far_plane;
+  FbxDouble3 pos, target, up;
+  FbxDouble roll;
+  FbxDouble aspect_ratio;
+  FbxDouble fov;
+  FbxDouble near_plane, far_plane;
 };
 
 struct Light {
@@ -406,9 +406,9 @@ struct Light {
   string name;
   Type type;
   Decay decay;
-  fbxDouble3 pos;
-  fbxDouble3 color;
-  fbxDouble1 intensity;
+  FbxDouble3 pos;
+  FbxDouble3 color;
+  FbxDouble intensity;
 };
 
 struct Hierarchy {
@@ -446,11 +446,11 @@ public:
   const vector<string> &errors() const { return _errors; }
 private:
 
-  bool traverse_scene(KFbxScene *scene);
+  bool traverse_scene(FbxScene *scene);
 
-  bool process_mesh(KFbxNode *node, KFbxMesh *mesh);
-  bool process_camera(KFbxNode *node, KFbxCamera *camera);
-  bool process_light(KFbxNode *node, KFbxLight *light);
+  bool process_mesh(FbxNode *node, FbxMesh *mesh);
+  bool process_camera(FbxNode *node, FbxCamera *camera);
+  bool process_light(FbxNode *node, FbxLight *light);
 
   bool save_scene(const char *dst);
   bool save_meshes();
@@ -462,18 +462,18 @@ private:
   Scene _scene;
   Writer _writer;
 
-  KFbxScene *_fbx_scene;
-  KFbxSdkManager *_mgr;
-  KFbxIOSettings *_settings;
-  KFbxGeometryConverter *_converter;
-  KFbxImporter *_importer;
+  FbxScene *_fbx_scene;
+  FbxManager *_mgr;
+  FbxIOSettings *_settings;
+  FbxGeometryConverter *_converter;
+  FbxImporter *_importer;
 };
 
 FbxConverter::FbxConverter() 
-  : _mgr(KFbxSdkManager::Create())
-  , _settings(KFbxIOSettings::Create(_mgr, IOSROOT))
-  , _converter(new KFbxGeometryConverter(_mgr))
-  , _importer(KFbxImporter::Create(_mgr, ""))
+  : _mgr(FbxManager::Create())
+  , _settings(FbxIOSettings::Create(_mgr, IOSROOT))
+  , _converter(new FbxGeometryConverter(_mgr))
+  , _importer(FbxImporter::Create(_mgr, ""))
 {
 }
 
@@ -502,17 +502,17 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   if (!res)
     return false;
 
-  _fbx_scene = KFbxScene::Create(_mgr, "my_scene");
+  _fbx_scene = FbxScene::Create(_mgr, "my_scene");
   _importer->Import(_fbx_scene);
 
-  KFbxAxisSystem &axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
+  FbxAxisSystem &axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
   int up_sign, front_sign;
-  KFbxAxisSystem::eUpVector up = axis.GetUpVector(up_sign);
-  KFbxAxisSystem::eFrontVector front = axis.GetFrontVector(front_sign);
-  KFbxAxisSystem::eCoorSystem handed = axis.GetCoorSystem();
+  FbxAxisSystem::EUpVector up = axis.GetUpVector(up_sign);
+  FbxAxisSystem::EFrontVector front = axis.GetFrontVector(front_sign);
+  FbxAxisSystem::ECoordSystem handed = axis.GetCoorSystem();
 
   // check that the scene is exported with a 3ds-max compliant coordinate system
-  KFbxAxisSystem max_system(KFbxAxisSystem::eMax);
+  FbxAxisSystem max_system(FbxAxisSystem::eMax);
   if (max_system != axis) {
     printf("Unsupported coordinate system.");
     return false;
@@ -527,17 +527,17 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   return true;
 }
 
-bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
+bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
 
   if (!light->CastLight.Get())
     return true;
 
-  KFbxAnimEvaluator *evaluator = _fbx_scene->GetEvaluator();
+  FbxAnimEvaluator *evaluator = _fbx_scene->GetEvaluator();
 
   Light *l = new Light;
   l->name = node->GetName();
-  KFbxMatrix mtx = evaluator->GetNodeGlobalTransform(node);
-  l->pos = max_to_dx(fbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
+  FbxMatrix mtx = evaluator->GetNodeGlobalTransform(node);
+  l->pos = max_to_dx(FbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
   l->color = light->Color.Get();
 
   _scene.lights.push_back(l);
@@ -549,13 +549,13 @@ bool FbxConverter::process_light(KFbxNode *node, KFbxLight *light) {
   return true;
 }
 
-bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
+bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
-  KFbxCamera::ECameraApertureMode mode = camera->GetApertureMode();
+  FbxCamera::EApertureMode mode = camera->GetApertureMode();
   double w = camera->GetApertureWidth();
   double h = camera->GetApertureHeight();
 
-  KFbxCamera::ECameraAspectRatioMode ar_mode = camera->GetAspectRatioMode();
+  FbxCamera::EAspectRatioMode ar_mode = camera->GetAspectRatioMode();
 
   Camera *c = new Camera;
   c->name = node->GetName();
@@ -578,11 +578,11 @@ bool FbxConverter::process_camera(KFbxNode *node, KFbxCamera *camera) {
   return true;
 }
 
-bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
+bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
   int material_count = fbx_node->GetMaterialCount();
   for (int i = 0; i < material_count; ++i) {
-    KFbxSurfaceMaterial *node_material = fbx_node->GetMaterial(i);
+    FbxSurfaceMaterial *node_material = fbx_node->GetMaterial(i);
     const char *name = node_material->GetName();
 
     // Skip if we've already seen this material
@@ -598,31 +598,33 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
     material->technique = "diffuse";
 
-#define PROP(name, type) KFbxSurfaceMaterial::name, KFbxGet<type>(node_material->FindProperty(KFbxSurfaceMaterial::name))
-    material->properties.push_back(MaterialProperty(PROP(sEmissive, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sEmissiveFactor, fbxDouble1)));
+//#define PROP(name, type) FbxSurfaceMaterial::name, FbxSurfaceMaterial::Get<type>(node_material->FindProperty(FbxSurfaceMaterial::name))
+#define PROP(name, type) #name, FbxSurfaceMaterial::Get<type>(node_material->FindProperty(FbxSurfaceMaterial::name))
+/*
+    material->properties.push_back(MaterialProperty(PROP(sEmissive, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sEmissiveFactor, FbxDouble)));
 
-    material->properties.push_back(MaterialProperty(PROP(sAmbient, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sAmbientFactor, fbxDouble1)));
+    material->properties.push_back(MaterialProperty(PROP(sAmbient, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sAmbientFactor, FbxDouble)));
 
-    material->properties.push_back(MaterialProperty(PROP(sDiffuse, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sDiffuseFactor, fbxDouble1)));
+    material->properties.push_back(MaterialProperty(PROP(sDiffuse, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sDiffuseFactor, FbxDouble)));
 
-    material->properties.push_back(MaterialProperty(PROP(sSpecular, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sSpecularFactor, fbxDouble1)));
-    material->properties.push_back(MaterialProperty(PROP(sShininess, fbxDouble1)));
+    material->properties.push_back(MaterialProperty(PROP(sSpecular, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sSpecularFactor, FbxDouble)));
+    material->properties.push_back(MaterialProperty(PROP(sShininess, FbxDouble)));
 
-    material->properties.push_back(MaterialProperty(PROP(sTransparentColor, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sTransparencyFactor, fbxDouble1)));
+    material->properties.push_back(MaterialProperty(PROP(sTransparentColor, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sTransparencyFactor, FbxDouble)));
 
-    material->properties.push_back(MaterialProperty(PROP(sReflection, fbxDouble4)));
-    material->properties.push_back(MaterialProperty(PROP(sReflectionFactor, fbxDouble1)));
-
+    material->properties.push_back(MaterialProperty(PROP(sReflection, FbxDouble4)));
+    material->properties.push_back(MaterialProperty(PROP(sReflectionFactor, FbxDouble)));
+*/
 #undef PROP
   }
 
   // just use layer 0.
-  KFbxLayer *layer = fbx_mesh->GetLayer(0);
+  FbxLayer *layer = fbx_mesh->GetLayer(0);
   CHECK_FATAL(layer, "no layer 0 found");
 
   // group the polygons by material
@@ -632,19 +634,19 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
     polys_by_material.push_back(vector<int>());
 
   bool use_default_material = false;
-  if (const KFbxLayerElementMaterial *materials = layer->GetMaterials()) {
-    KFbxLayerElement::EMappingMode mm = materials->GetMappingMode();
+  if (const FbxLayerElementMaterial *materials = layer->GetMaterials()) {
+    FbxLayerElement::EMappingMode mm = materials->GetMappingMode();
     static const char *mm_str[] = { "eNONE", "eBY_CONTROL_POINT", "eBY_POLYGON_VERTEX", "eBY_POLYGON", "eBY_EDGE", "eALL_SAME" };
-    CHECK_FATAL(mm == KFbxLayerElement::eBY_POLYGON || mm == KFbxLayerElement::eALL_SAME, 
-                "Unsupported mapping mode: %s", mm <= KFbxLayerElement::eALL_SAME ? mm_str[mm] : "unknown");
+    CHECK_FATAL(mm == FbxLayerElement::eByPolygon|| mm == FbxLayerElement::eAllSame, 
+                "Unsupported mapping mode: %s", mm <= FbxLayerElement::eAllSame ? mm_str[mm] : "unknown");
 
-    const KFbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
-    if (mm == KFbxLayerElement::eBY_POLYGON) {
+    const FbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
+    if (mm == FbxLayerElement::eByPolygon) {
       // each poly has its own material index
       for (int i = 0; i < arr.GetCount(); ++i) {
         polys_by_material[arr[i]].push_back(i);
       }
-    } else if (mm == KFbxLayerElement::eALL_SAME) {
+    } else if (mm == FbxLayerElement::eAllSame) {
       // all the polys share the same material
       for (int i = 0; i < fbx_mesh->GetPolygonCount(); ++i)
         polys_by_material[0].push_back(i);
@@ -665,10 +667,10 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
   Mesh *mesh = new Mesh(fbx_node->GetName());
   _scene.meshes.push_back(mesh);
 
-  KFbxXMatrix mtx = fbx_node->EvaluateGlobalTransform();
-  fbxDouble4 s = max_to_dx(mtx.GetS());
-  fbxDouble4 q = max_to_dx(mtx.GetQ(), true);
-  fbxDouble4 t = max_to_dx(mtx.GetT());
+  FbxAMatrix mtx = fbx_node->EvaluateGlobalTransform();
+  FbxDouble4 s = max_to_dx(mtx.GetS());
+  FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
+  FbxDouble4 t = max_to_dx(mtx.GetT());
 
   if (g_verbose) {
     printf("# found mesh: %s (%Iu submesh%s)\n", mesh->name.c_str(), polys_by_material.size(), 
@@ -701,7 +703,7 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
       CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
       // we reverse the winding order to convert between the right and left-handed systems
-      KFbxVector4 pos, normal;
+      FbxVector4 pos, normal;
       for (int k = 2; k >= 0; --k) {
         pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
         fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
@@ -709,7 +711,7 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 
         SuperVertex cand(pos, normal);
         for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
-          KFbxVector2 uv;
+          FbxVector2 uv;
           fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
           cand.uv.push_back(uv);
         }
@@ -738,25 +740,25 @@ bool FbxConverter::process_mesh(KFbxNode *fbx_node, KFbxMesh *fbx_mesh) {
 }
 
 
-bool FbxConverter::traverse_scene(KFbxScene *scene) {
+bool FbxConverter::traverse_scene(FbxScene *scene) {
 
-  if (KFbxNode *root = scene->GetRootNode()) {
+  if (FbxNode *root = scene->GetRootNode()) {
     for (int i = 0; i < root->GetChildCount(); ++i) {
-      KFbxNode *child = root->GetChild(i);
-      KFbxNodeAttribute *node_attr = child->GetNodeAttribute();
+      FbxNode *child = root->GetChild(i);
+      FbxNodeAttribute *node_attr = child->GetNodeAttribute();
       if (!node_attr)
         continue;
 
       switch (node_attr->GetAttributeType()) {
-      case KFbxNodeAttribute::eMARKER:
+      case FbxNodeAttribute::eMarker:
         break;
 
-      case KFbxNodeAttribute::eSKELETON:
+      case FbxNodeAttribute::eSkeleton:
         break;
 
-      case KFbxNodeAttribute::eMESH:
+      case FbxNodeAttribute::eMesh:
         {
-          KFbxMesh *triangulated = _converter->TriangulateMesh((KFbxMesh *)node_attr);
+          FbxMesh *triangulated = _converter->TriangulateMesh((FbxMesh *)node_attr);
           bool res = process_mesh(child, triangulated);
           triangulated->Destroy();
           if (!res)
@@ -764,24 +766,16 @@ bool FbxConverter::traverse_scene(KFbxScene *scene) {
         }
         break;
 
-      case KFbxNodeAttribute::eNURB:
-        break;
-
-      case KFbxNodeAttribute::ePATCH:
-        break;
-
-      case KFbxNodeAttribute::eCAMERA:
-        if (!process_camera(child, (KFbxCamera *)node_attr))
+      case FbxNodeAttribute::eCamera:
+        if (!process_camera(child, (FbxCamera *)node_attr))
           return false;
         break;
 
-      case KFbxNodeAttribute::eLIGHT:
-        if (!process_light(child, (KFbxLight *)node_attr))
+      case FbxNodeAttribute::eLight:
+        if (!process_light(child, (FbxLight *)node_attr))
           return false;
         break;
 
-      case KFbxNodeAttribute::eLODGROUP:
-        break;
       }   
     }
   }
@@ -830,13 +824,13 @@ bool FbxConverter::save_scene(const char *dst) {
   return true;
 }
 
-void write_vector(const Writer &writer, const fbxDouble3 &v) {
+void write_vector(const Writer &writer, const FbxDouble3 &v) {
   writer.write((float)v[0]);
   writer.write((float)v[1]);
   writer.write((float)v[2]);
 }
 
-void write_vector(const Writer &writer, const fbxDouble4 &v) {
+void write_vector(const Writer &writer, const FbxDouble4 &v) {
   writer.write((float)v[0]);
   writer.write((float)v[1]);
   writer.write((float)v[2]);

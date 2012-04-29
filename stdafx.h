@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <tchar.h>
 
+#define FBXSDK_NEW_API
 #include <fbxsdk.h>
+
 #include <string>
 #include <vector>
 #include <stdint.h>
