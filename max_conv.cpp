@@ -72,7 +72,7 @@ struct BlockHeader {
 
 template<class T> 
 void seq_delete(T* t) {
-  for (T::iterator it = t->begin(); it != t->end(); ++it)
+  for (auto it = t->begin(); it != t->end(); ++it)
     delete *it;
   t->clear();
 }
@@ -503,6 +503,13 @@ private:
   Scene _scene;
   Writer _writer;
 
+  FbxTime _start_time;
+  FbxTime _stop_time;
+
+  FbxLongLong _duration_ms;
+  double _fps;
+
+  FbxAnimEvaluator *_evaluator;
   FbxScene *_fbx_scene;
   FbxManager *_mgr;
   FbxIOSettings *_settings;
@@ -516,6 +523,7 @@ FbxConverter::FbxConverter()
   , _converter(new FbxGeometryConverter(_mgr))
   , _importer(FbxImporter::Create(_mgr, ""))
   , _indent_level(0)
+  , _evaluator(nullptr)
 {
   memset(_indent_buffer, ' ', cMaxIndent);
   _indent_buffer[cMaxIndent] = '\0';
@@ -549,9 +557,19 @@ bool FbxConverter::convert_inner(const char *src, const char *dst) {
   }
 
   _fbx_scene = FbxScene::Create(_mgr, "my_scene");
+  _evaluator = _fbx_scene->GetEvaluator();
   _importer->Import(_fbx_scene);
+  const FbxGlobalSettings &global_settings = _fbx_scene->GetGlobalSettings();
+  auto time_mode = global_settings.GetTimeMode();
+  FbxTimeSpan time_span;
+  global_settings.GetTimelineDefaultTimeSpan(time_span);
+  _start_time = time_span.GetStart();
+  _stop_time = time_span.GetStop();
+  auto duration = time_span.GetDuration();
+  _duration_ms = duration.GetMilliSeconds();
+  _fps = duration.GetFrameRate(time_mode);
 
-  FbxAxisSystem &axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
+  auto axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
   int up_sign, front_sign;
   FbxAxisSystem::EUpVector up = axis.GetUpVector(up_sign);
   FbxAxisSystem::EFrontVector front = axis.GetFrontVector(front_sign);
@@ -1098,6 +1116,9 @@ int parse_cmd_line(LPSTR lpCmdLine) {
 
   replace(begin(g_src), end(g_src), '\\', '/');
   replace(begin(g_dst), end(g_dst), '\\', '/');
+
+  boost::erase_all(g_src, "\"");
+  boost::erase_all(g_dst, "\"");
 
   return 0;
 }
