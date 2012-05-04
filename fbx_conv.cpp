@@ -38,8 +38,11 @@ const int FILE_CHANGED_TIMER_ID = 1;
 
 #pragma comment(lib, "d3dx10.lib")
 
+#define FILE_VERSION 2
+
 #pragma pack(push, 1)
 struct MainHeader {
+  int version;
   int material_ofs;
   int mesh_ofs;
   int light_ofs;
@@ -56,6 +59,7 @@ namespace BlockId {
     kMeshes,
     kCameras,
     kLights,
+    kAnimation,
   };
 }
 
@@ -314,7 +318,21 @@ FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
 FbxDouble3 max_to_dx(const FbxDouble3 &m) {
   return FbxDouble3(m[0], m[2], m[1]);
 }
+
 #endif
+D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
+  D3DXMATRIX mtx_s, mtx_r, mtx_t;
+
+  FbxDouble4 s = max_to_dx(mtx.GetS());
+  FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
+  FbxDouble4 t = max_to_dx(mtx.GetT());
+
+  return 
+    *D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
+    *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
+    *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
+}
+
 
 struct Vector2 {
   Vector2() {}
@@ -446,6 +464,14 @@ struct Animation {
 
 };
 
+#pragma pack(push, 1)
+struct KeyFrame {
+  KeyFrame(double time, const D3DXMATRIX &mtx) : time(time), mtx(mtx) {}
+  double time;
+  D3DXMATRIX mtx;
+};
+#pragma pack(pop)
+
 struct Scene {
   ~Scene() {
     assoc_delete(&materials);
@@ -485,6 +511,7 @@ private:
   bool save_scene(const char *dst);
   bool save_meshes();
   bool save_cameras();
+  bool save_animations();
   bool save_lights();
   bool save_materials();
 
@@ -507,6 +534,7 @@ private:
   char _indent_buffer[cMaxIndent+1];
 
   vector<string> _errors;
+  map<string, vector<KeyFrame>> _animation;
   Scene _scene;
   Writer _writer;
 
@@ -636,6 +664,9 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
     add_info("found light: %s", l->name.c_str());
   }
 
+  if (!process_animation(node))
+    return false;
+
   return true;
 }
 
@@ -661,13 +692,14 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
 
-  process_animation(node);
-
   _scene.cameras.push_back(c);
 
   if (g_verbose) {
     add_info("found camera: %s", c->name.c_str());
   }
+
+  if (!process_animation(node))
+    return false;
 
   return true;
 }
@@ -729,18 +761,13 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 bool FbxConverter::process_animation(FbxNode *node) {
   INFO_SCOPE;
 
+  vector<KeyFrame> &anims = _animation[node->GetName()];
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
   for (int i = 0; i <= num_frames; ++i) {
     FbxTime cur;
-    cur.SetSecondDouble(i*_duration/num_frames);
-    const FbxAMatrix &mtx = node->EvaluateGlobalTransform(cur);
-    FbxDouble4 s = max_to_dx(mtx.GetS());
-    FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
-    FbxDouble4 t = max_to_dx(mtx.GetT());
-
-    char buf[256];
-    sprintf(buf, "x: %f, y: %f, z: %f\n", t[0], t[1], t[2]);
-    OutputDebugStringA(buf);
+    double cur_time = i*_duration/num_frames;
+    cur.SetSecondDouble(cur_time);
+    anims.emplace_back(KeyFrame(cur_time, max_to_dx(node->EvaluateGlobalTransform(cur))));
   }
 
   return true;
@@ -801,23 +828,11 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   shared_ptr<Mesh> mesh(new Mesh(fbx_node->GetName()));
   _scene.meshes.push_back(mesh);
 
-  FbxAMatrix mtx = fbx_node->EvaluateGlobalTransform();
-  FbxDouble4 s = max_to_dx(mtx.GetS());
-  FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
-  FbxDouble4 t = max_to_dx(mtx.GetT());
-
   if (g_verbose) {
     add_info("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
   }
 
-  D3DXMATRIX mtx_s, mtx_r, mtx_t;
-
-  mesh->obj_to_world = 
-    *D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
-    *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
-    *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
-
-  process_animation(fbx_node);
+  mesh->obj_to_world = max_to_dx(fbx_node->EvaluateGlobalTransform());
 
   uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
   vertex_flags |= uv_sets.size() == 2 ? SubMesh::kTex1 | SubMesh::kTex0 : uv_sets.size() == 1 ? SubMesh::kTex0 : 0;
@@ -875,6 +890,9 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     }
   }
 
+  if (!process_animation(fbx_node))
+    return false;
+
   return true;
 }
 
@@ -930,6 +948,7 @@ bool FbxConverter::save_scene(const char *dst) {
     return false;
 
   MainHeader header;
+  header.version = FILE_VERSION;
   _writer.push_pos();
   _writer.write(header);
 
@@ -947,6 +966,10 @@ bool FbxConverter::save_scene(const char *dst) {
 
   header.camera_ofs = _writer.pos();
   if (!save_cameras())
+    return false;
+
+  header.animation_ofs = _writer.pos();
+  if (!save_animations())
     return false;
 
   header.string_ofs = _writer.pos();
@@ -973,6 +996,24 @@ void write_vector(const Writer &writer, const FbxDouble4 &v) {
   writer.write((float)v[0]);
   writer.write((float)v[1]);
   writer.write((float)v[2]);
+}
+
+bool FbxConverter::save_animations() {
+  BlockHeader header;
+  header.id = BlockId::kAnimation;
+  ScopedBlock scoped_block(header, _writer);
+
+  _writer.write((int)_animation.size());
+
+  for (auto it = begin(_animation); it != end(_animation); ++it) {
+    const string &node_name = it->first;
+    const vector<KeyFrame> &frames = it->second;
+    _writer.add_deferred_string(node_name);
+    _writer.write((int)frames.size());
+    _writer.write_raw(&frames[0], sizeof(KeyFrame) * frames.size());
+  }
+
+  return true;
 }
 
 bool FbxConverter::save_cameras() {
