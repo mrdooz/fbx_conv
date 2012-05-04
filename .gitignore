@@ -24,3 +24,4 @@ ipch/
 *.user
 *.swp
 _ReSharper.max_conv/*
+_ReSharper.fbx_conv/*

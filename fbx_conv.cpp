@@ -1,14 +1,6 @@
 // converter between .fbx and .kumi format
 
 #include "stdafx.h"
-#include <d3d11.h>
-#include <D3DX10math.h>
-#include <algorithm>
-#include <iterator>
-#include <iostream>
-#include <sstream>
-#include <boost/algorithm/string.hpp>
-#include <io.h>
 
 typedef uint16_t uint16;
 typedef uint32_t uint32;
@@ -17,6 +9,8 @@ using namespace std;
 using namespace stdext;
 
 class FbxConverter;
+
+#define USE_DIRECTX_SYSTEM 1
 
 bool g_verbose;
 bool g_file_watch;
@@ -50,6 +44,7 @@ struct MainHeader {
   int mesh_ofs;
   int light_ofs;
   int camera_ofs;
+  int animation_ofs;
   int string_ofs;
   int binary_ofs;
   int total_size;
@@ -302,6 +297,16 @@ struct SuperVertex {
   }
 };
 
+
+#if USE_DIRECTX_SYSTEM
+FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
+  return FbxDouble4(m[0], m[1], m[2], (neg_w ? -1 : 1) * m[3]);
+}
+
+FbxDouble3 max_to_dx(const FbxDouble3 &m) {
+  return m;
+}
+#else
 FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
   return FbxDouble4(m[0], m[2], m[1], (neg_w ? -1 : 1) * m[3]);
 }
@@ -309,6 +314,7 @@ FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
 FbxDouble3 max_to_dx(const FbxDouble3 &m) {
   return FbxDouble3(m[0], m[2], m[1]);
 }
+#endif
 
 struct Vector2 {
   Vector2() {}
@@ -443,7 +449,6 @@ struct Animation {
 struct Scene {
   ~Scene() {
     assoc_delete(&materials);
-    seq_delete(&meshes);
     seq_delete(&lights);
     seq_delete(&cameras);
   }
@@ -456,7 +461,7 @@ struct Scene {
   Cameras cameras;
   Lights lights;
   Materials materials;
-  Meshes meshes;
+  vector<shared_ptr<Mesh>> meshes;
 };
 
 class FbxConverter {
@@ -474,6 +479,8 @@ private:
   bool process_material(FbxNode *node, int *material_count);
   bool process_camera(FbxNode *node, FbxCamera *camera);
   bool process_light(FbxNode *node, FbxLight *light);
+
+  bool process_animation(FbxNode *node);
 
   bool save_scene(const char *dst);
   bool save_meshes();
@@ -507,6 +514,7 @@ private:
   FbxTime _stop_time;
 
   FbxLongLong _duration_ms;
+  double _duration;
   double _fps;
 
   FbxAnimEvaluator *_evaluator;
@@ -565,22 +573,25 @@ bool FbxConverter::convert_inner(const char *src, const char *dst) {
   global_settings.GetTimelineDefaultTimeSpan(time_span);
   _start_time = time_span.GetStart();
   _stop_time = time_span.GetStop();
-  auto duration = time_span.GetDuration();
-  _duration_ms = duration.GetMilliSeconds();
-  _fps = duration.GetFrameRate(time_mode);
+  _duration = time_span.GetDuration().GetSecondDouble();
+  _duration_ms = time_span.GetDuration().GetMilliSeconds();
+  _fps = time_span.GetDuration().GetFrameRate(time_mode);
 
   auto axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
-  int up_sign, front_sign;
-  FbxAxisSystem::EUpVector up = axis.GetUpVector(up_sign);
-  FbxAxisSystem::EFrontVector front = axis.GetFrontVector(front_sign);
-  FbxAxisSystem::ECoordSystem handed = axis.GetCoorSystem();
 
-  // check that the scene is exported with a 3ds-max compliant coordinate system
-  FbxAxisSystem max_system(FbxAxisSystem::eMax);
-  if (max_system != axis) {
-    _errors.push_back("Unsupported coordinate system.");
+  // check if we need to convert the scene to a DirectX coordinate system
+#if USE_DIRECTX_SYSTEM
+  if (axis != FbxAxisSystem::eDirectX) {
+    FbxAxisSystem dx_system(FbxAxisSystem::eDirectX);
+    dx_system.ConvertScene(_fbx_scene);
+  }
+#else
+  // require a 3ds-max system
+  if (axis != FbxAxisSystem::eMax) {
+    add_error("We require a 3ds-max coordinate system");
     return false;
   }
+#endif
 
   traverse_scene(_fbx_scene);
   save_scene(dst);
@@ -650,6 +661,8 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
 
+  process_animation(node);
+
   _scene.cameras.push_back(c);
 
   if (g_verbose) {
@@ -713,6 +726,26 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
   return true;
 }
 
+bool FbxConverter::process_animation(FbxNode *node) {
+  INFO_SCOPE;
+
+  int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
+  for (int i = 0; i <= num_frames; ++i) {
+    FbxTime cur;
+    cur.SetSecondDouble(i*_duration/num_frames);
+    const FbxAMatrix &mtx = node->EvaluateGlobalTransform(cur);
+    FbxDouble4 s = max_to_dx(mtx.GetS());
+    FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
+    FbxDouble4 t = max_to_dx(mtx.GetT());
+
+    char buf[256];
+    sprintf(buf, "x: %f, y: %f, z: %f\n", t[0], t[1], t[2]);
+    OutputDebugStringA(buf);
+  }
+
+  return true;
+}
+
 bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
   INFO_SCOPE;
@@ -765,7 +798,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   for (int i = 0; i < layer->GetUVSetCount(); ++i)
     uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
-  Mesh *mesh = new Mesh(fbx_node->GetName());
+  shared_ptr<Mesh> mesh(new Mesh(fbx_node->GetName()));
   _scene.meshes.push_back(mesh);
 
   FbxAMatrix mtx = fbx_node->EvaluateGlobalTransform();
@@ -783,6 +816,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     *D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
     *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
+
+  process_animation(fbx_node);
 
   uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
   vertex_flags |= uv_sets.size() == 2 ? SubMesh::kTex1 | SubMesh::kTex0 : uv_sets.size() == 1 ? SubMesh::kTex0 : 0;
@@ -802,9 +837,13 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       const int poly_idx = indices[j];
       CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
-      // we reverse the winding order to convert between the right and left-handed systems
       FbxVector4 pos, normal;
+#if USE_DIRECTX_SYSTEM
+      for (int k = 0; k <= 2; ++k) {
+#else
+      // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
+#endif
         pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
         fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
         normal = max_to_dx(normal);
@@ -987,11 +1026,12 @@ bool FbxConverter::save_meshes() {
   header.id = BlockId::kMeshes;
   ScopedBlock scoped_block(header, _writer);
 
-  Scene::Meshes &meshes = _scene.meshes;
+  auto &meshes = _scene.meshes;
 
   _writer.write((int)meshes.size());
   for (size_t i = 0; i < meshes.size(); ++i) {
-    Mesh *mesh = meshes[i];
+
+    auto &mesh = meshes[i];
     _writer.add_deferred_string(mesh->name);
     _writer.write(mesh->obj_to_world);
 
@@ -1247,7 +1287,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SetEvent(g_quit_event);
     WaitForSingleObject(thread, INFINITE);
 
-    CloseHandle(g_hwnd);
+    //CloseHandle(g_hwnd);
     CloseHandle(g_dir);
   } else {
     g_converter = new FbxConverter();

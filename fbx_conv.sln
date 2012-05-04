@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 11.00
 # Visual Studio 2010
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "max_conv", "max_conv.vcxproj", "{4BE8B0B7-6E1B-4AC4-9D25-5C890B654E8F}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "fbx_conv", "fbx_conv.vcxproj", "{4BE8B0B7-6E1B-4AC4-9D25-5C890B654E8F}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
