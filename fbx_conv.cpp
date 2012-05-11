@@ -2,6 +2,7 @@
 
 #include "stdafx.h"
 
+typedef uint8_t uint8;
 typedef uint16_t uint16;
 typedef uint32_t uint32;
 
@@ -10,7 +11,7 @@ using namespace stdext;
 
 class FbxConverter;
 
-#define USE_DIRECTX_SYSTEM 1
+#define USE_DIRECTX_SYSTEM 0
 
 bool g_verbose;
 bool g_file_watch;
@@ -30,6 +31,8 @@ const int FILE_CHANGED_TIMER_ID = 1;
 #define GEN_NAME(prefix, line) GEN_NAME2(prefix, line)
 #define MAKE_SCOPED(type) type GEN_NAME(ANON, __COUNTER__)
 
+#define RANGE(x) begin(x), end(x)
+
 #if _DEBUG
 #pragma comment(lib, "fbxsdk-2013.1-mdd.lib")
 #else
@@ -38,7 +41,7 @@ const int FILE_CHANGED_TIMER_ID = 1;
 
 #pragma comment(lib, "d3dx10.lib")
 
-#define FILE_VERSION 2
+#define FILE_VERSION 3
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -48,7 +51,6 @@ struct MainHeader {
   int light_ofs;
   int camera_ofs;
   int animation_ofs;
-  int string_ofs;
   int binary_ofs;
   int total_size;
 };
@@ -89,23 +91,18 @@ public:
   ~Writer() {
     if (_f)
       fclose(_f);
-
-    for (size_t i = 0; i < _deferred_binary.size(); ++i)
-      delete [] _deferred_binary[i].data;
-    _deferred_binary.clear();
   }
 
-  struct DeferredString {
-    DeferredString(int ofs, const string &str) : ofs(ofs), str(str) {}
-    int ofs;
-    string str;
-  };
-
   struct DeferredBinary {
-    DeferredBinary(int ofs, void *data, int len) : ofs(ofs), data(data), len(len) {}
+    DeferredBinary(int ofs, const void *d, int len, bool save_len)
+      : ofs(ofs)
+      , save_len(save_len) {
+        data.resize(len);
+        memcpy(&data[0], d, len);
+    }
     int ofs;
-    void *data;
-    int len;
+    bool save_len;
+    vector<uint8> data;
   };
 
   bool open(const char *filename) {
@@ -120,34 +117,14 @@ public:
 
   void add_deferred_string(const string &str) {
     int p = pos();
-    _deferred_strings.push_back(DeferredString(p, str));
+    _deferred_binary.push_back(DeferredBinary(p, str.data(), str.size() + 1, false));
     write(p);
   }
 
   void add_deferred_binary(void *data, int len) {
     int p = pos();
-    _deferred_binary.push_back(DeferredBinary(p, data, len));
+    _deferred_binary.push_back(DeferredBinary(p, data, len, true));
     write(p);
-  }
-
-  void save_strings() {
-
-    // save the # deferred strings and their locations
-    write((int)_deferred_strings.size());
-    for (size_t i = 0; i<  _deferred_strings.size(); ++i)
-      write(_deferred_strings[i].ofs);
-
-    for (size_t i = 0; i < _deferred_strings.size(); ++i) {
-      // for each deferred string, save the string, and update the
-      // inplace offset to point to it
-      int p = pos();
-      DeferredString &str = _deferred_strings[i];
-      write_raw(str.str.c_str(), str.str.size() + 1);
-      push_pos();
-      set_pos(str.ofs);
-      write(p);
-      pop_pos();
-    }
   }
 
   void save_binary() {
@@ -160,11 +137,14 @@ public:
 
     for (size_t i = 0; i < _deferred_binary.size(); ++i) {
       // the offset is relative the start of the binary block
+      auto &cur = _deferred_binary[i];
       int ofs = pos() - binary_start;
-      write(_deferred_binary[i].len);
-      write_raw(_deferred_binary[i].data, _deferred_binary[i].len);
+      int len = (int)cur.data.size();
+      if (cur.save_len)
+        write(len);
+      write_raw(&cur.data[0], len);
       push_pos();
-      set_pos(_deferred_binary[i].ofs);
+      set_pos(cur.ofs);
       write(ofs);
       pop_pos();
     }
@@ -208,7 +188,6 @@ public:
   }
 
 private:
-  vector<DeferredString> _deferred_strings;
   vector<DeferredBinary> _deferred_binary;
 
   deque<int> _file_pos_stack;
@@ -409,9 +388,9 @@ void compact_index_data(const SubMesh &submesh, void **data, int *len, int *inde
   void *buf = new char[*len];
   *data = buf;
   if (need_32_bit)
-    copy(begin(submesh.indices), end(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
+    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
   else
-    copy(begin(submesh.indices), end(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
+    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
 }
 
 struct Mesh {
@@ -460,10 +439,6 @@ struct Hierarchy {
 
 };
 
-struct Animation {
-
-};
-
 #pragma pack(push, 1)
 struct KeyFrame {
   KeyFrame(double time, const D3DXMATRIX &mtx) : time(time), mtx(mtx) {}
@@ -499,7 +474,8 @@ private:
 
   bool convert_inner(const char *src, const char *dst);
 
-  bool traverse_scene(FbxScene *scene);
+  // like a CSI!
+  bool process_scene(FbxScene *scene);
 
   bool process_mesh(FbxNode *node, FbxMesh *mesh);
   bool process_material(FbxNode *node, int *material_count);
@@ -621,7 +597,7 @@ bool FbxConverter::convert_inner(const char *src, const char *dst) {
   }
 #endif
 
-  traverse_scene(_fbx_scene);
+  process_scene(_fbx_scene);
   save_scene(dst);
 
   _fbx_scene->Destroy();
@@ -635,10 +611,7 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   add_info("===================================================================");
   bool res = convert_inner(src, dst);
 
-  copy(begin(_errors), end(_errors), ostream_iterator<string>(cout));
-
-  for (auto it = begin(_errors); it != end(_errors); ++it)
-    printf("%s\n", it->c_str());
+  copy(RANGE(_errors), ostream_iterator<string>(cout));
 
   return res;
 }
@@ -758,8 +731,103 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
   return true;
 }
 
+// Get the geometry offset to a node. It is never inherited by the children.
+FbxAMatrix GetGeometry(FbxNode* pNode)
+{
+  const FbxVector4 lT = pNode->GetGeometricTranslation(FbxNode::eSourcePivot);
+  const FbxVector4 lR = pNode->GetGeometricRotation(FbxNode::eSourcePivot);
+  const FbxVector4 lS = pNode->GetGeometricScaling(FbxNode::eSourcePivot);
+
+  return FbxAMatrix(lT, lR, lS);
+}
+
+void print_matrix(const FbxAMatrix &mtx) {
+  char buf[512];
+  sprintf(buf, "[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n", 
+    mtx.Get(0, 0), mtx.Get(0, 1), mtx.Get(0, 2), mtx.Get(0, 3),
+    mtx.Get(1, 0), mtx.Get(1, 1), mtx.Get(1, 2), mtx.Get(1, 3),
+    mtx.Get(2, 0), mtx.Get(2, 1), mtx.Get(2, 2), mtx.Get(2, 3),
+    mtx.Get(3, 0), mtx.Get(3, 1), mtx.Get(3, 2), mtx.Get(3, 3));
+  OutputDebugStringA(buf);
+}
+
+
+FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex);
+FbxAMatrix GetGlobalPosition(FbxNode* pNode, const FbxTime& pTime, FbxPose* pPose = NULL, FbxAMatrix* pParentGlobalPosition = NULL);
+FbxAMatrix GetGlobalPosition(FbxNode* pNode, const FbxTime& pTime, FbxPose* pPose, FbxAMatrix* pParentGlobalPosition)
+{
+  FbxAMatrix lGlobalPosition;
+  bool        lPositionFound = false;
+
+  if (pPose)
+  {
+    int lNodeIndex = pPose->Find(pNode);
+
+    if (lNodeIndex > -1)
+    {
+      // The bind pose is always a global matrix.
+      // If we have a rest pose, we need to check if it is
+      // stored in global or local space.
+      if (pPose->IsBindPose() || !pPose->IsLocalMatrix(lNodeIndex))
+      {
+        lGlobalPosition = GetPoseMatrix(pPose, lNodeIndex);
+      }
+      else
+      {
+        // We have a local matrix, we need to convert it to
+        // a global space matrix.
+        FbxAMatrix lParentGlobalPosition;
+
+        if (pParentGlobalPosition)
+        {
+          lParentGlobalPosition = *pParentGlobalPosition;
+        }
+        else
+        {
+          if (pNode->GetParent())
+          {
+            lParentGlobalPosition = GetGlobalPosition(pNode->GetParent(), pTime, pPose);
+          }
+        }
+
+        FbxAMatrix lLocalPosition = GetPoseMatrix(pPose, lNodeIndex);
+        lGlobalPosition = lParentGlobalPosition * lLocalPosition;
+      }
+
+      lPositionFound = true;
+    }
+  }
+
+  if (!lPositionFound)
+  {
+    // There is no pose entry for that node, get the current global position instead.
+
+    // Ideally this would use parent global position and local position to compute the global position.
+    // Unfortunately the equation 
+    //    lGlobalPosition = pParentGlobalPosition * lLocalPosition
+    // does not hold when inheritance type is other than "Parent" (RSrs).
+    // To compute the parent rotation and scaling is tricky in the RrSs and Rrs cases.
+    lGlobalPosition = pNode->EvaluateGlobalTransform(pTime);
+  }
+
+  return lGlobalPosition;
+}
+
+// Get the matrix of the given pose
+FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex)
+{
+  FbxAMatrix lPoseMatrix;
+  FbxMatrix lMatrix = pPose->GetMatrix(pNodeIndex);
+
+  memcpy((double*)lPoseMatrix, (double*)lMatrix, sizeof(lMatrix.mData));
+
+  return lPoseMatrix;
+}
+
 bool FbxConverter::process_animation(FbxNode *node) {
   INFO_SCOPE;
+
+  FbxAMatrix a = GetGeometry(node);
 
   vector<KeyFrame> &anims = _animation[node->GetName()];
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
@@ -767,7 +835,9 @@ bool FbxConverter::process_animation(FbxNode *node) {
     FbxTime cur;
     double cur_time = i*_duration/num_frames;
     cur.SetSecondDouble(cur_time);
-    anims.emplace_back(KeyFrame(cur_time, max_to_dx(node->EvaluateGlobalTransform(cur))));
+    FbxAMatrix m;
+    m = GetGlobalPosition(node, cur) * a;
+    anims.push_back(KeyFrame(cur_time, max_to_dx(m)));
   }
 
   return true;
@@ -798,7 +868,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   if (const FbxLayerElementMaterial *materials = layer->GetMaterials()) {
     FbxLayerElement::EMappingMode mm = materials->GetMappingMode();
     static const char *mm_str[] = { "eNONE", "eBY_CONTROL_POINT", "eBY_POLYGON_VERTEX", "eBY_POLYGON", "eBY_EDGE", "eALL_SAME" };
-    CHECK_FATAL(mm == FbxLayerElement::eByPolygon|| mm == FbxLayerElement::eAllSame, 
+    CHECK_FATAL(mm == FbxLayerElement::eByPolygon || mm == FbxLayerElement::eAllSame, 
                 "Unsupported mapping mode: %s", mm <= FbxLayerElement::eAllSame ? mm_str[mm] : "unknown");
 
     const FbxLayerElementArrayTemplate<int> &arr = materials->GetIndexArray();
@@ -896,8 +966,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   return true;
 }
 
-
-bool FbxConverter::traverse_scene(FbxScene *scene) {
+bool FbxConverter::process_scene(FbxScene *scene) {
 
   if (FbxNode *root = scene->GetRootNode()) {
     for (int i = 0; i < root->GetChildCount(); ++i) {
@@ -971,9 +1040,6 @@ bool FbxConverter::save_scene(const char *dst) {
   header.animation_ofs = _writer.pos();
   if (!save_animations())
     return false;
-
-  header.string_ofs = _writer.pos();
-  _writer.save_strings();
 
   header.binary_ofs = _writer.pos();
   _writer.save_binary();
@@ -1195,8 +1261,8 @@ int parse_cmd_line(LPSTR lpCmdLine) {
   g_src = tokens[argc-2].c_str();
   g_dst = tokens[argc-1].c_str();
 
-  replace(begin(g_src), end(g_src), '\\', '/');
-  replace(begin(g_dst), end(g_dst), '\\', '/');
+  replace(RANGE(g_src), '\\', '/');
+  replace(RANGE(g_dst), '\\', '/');
 
   boost::erase_all(g_src, "\"");
   boost::erase_all(g_dst, "\"");
@@ -1302,6 +1368,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   freopen("CONOUT$","wb",stdout);
   freopen("CONOUT$","wb",stderr);
 
+  HANDLE console_handle = GetStdHandle(STD_INPUT_HANDLE);
+
   if (parse_cmd_line(lpCmdLine))
     return 1;
 
@@ -1320,15 +1388,43 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     SendMessage(g_hwnd, WM_USER_CONVERT_FILE, 0, 0);
 
-    while(GetMessage(&msg, NULL, 0, 0)) {
-      TranslateMessage(&msg);
-      DispatchMessage(&msg);
-    }
+    bool done = false;
+    while (!done) {
+      if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+      }
+      INPUT_RECORD inputs[128];
+      DWORD events_read;
+      ReadConsoleInput(console_handle, inputs, 128, &events_read);
+      for (DWORD i = 0; i < events_read; ++i) {
+        if (inputs[i].EventType == KEY_EVENT && !inputs[i].Event.KeyEvent.bKeyDown) {
 
+          // keyup
+          switch (inputs[i].Event.KeyEvent.wVirtualKeyCode) {
+
+            case VK_ESCAPE:
+              msg.wParam = 0;
+              done = true;
+              break;
+
+            case 'F':
+              // force reparse
+              SendMessage(g_hwnd, WM_USER_CONVERT_FILE, 0, 0);
+              break;
+
+            case 'V':
+              g_verbose = !g_verbose;
+              printf("** VERBOSE: %s\n", g_verbose ? "on" : "off");
+              break;
+          }
+        }
+      }
+    }
+      
     SetEvent(g_quit_event);
     WaitForSingleObject(thread, INFINITE);
 
-    //CloseHandle(g_hwnd);
     CloseHandle(g_dir);
   } else {
     g_converter = new FbxConverter();
