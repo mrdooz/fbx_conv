@@ -2,6 +2,8 @@
 
 #include "stdafx.h"
 
+#define FILE_VERSION 4
+
 typedef uint8_t uint8;
 typedef uint16_t uint16;
 typedef uint32_t uint32;
@@ -41,7 +43,6 @@ const int FILE_CHANGED_TIMER_ID = 1;
 
 #pragma comment(lib, "d3dx10.lib")
 
-#define FILE_VERSION 3
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -298,6 +299,10 @@ FbxDouble3 max_to_dx(const FbxDouble3 &m) {
   return FbxDouble3(m[0], m[2], m[1]);
 }
 
+D3DXVECTOR3 max_to_dx2(const FbxDouble3 &m) {
+  return D3DXVECTOR3((float)m[0], (float)m[2], (float)m[1]);
+}
+
 #endif
 D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
   D3DXMATRIX mtx_s, mtx_r, mtx_t;
@@ -311,7 +316,6 @@ D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
     *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
 }
-
 
 struct Vector2 {
   Vector2() {}
@@ -440,11 +444,37 @@ struct Hierarchy {
 };
 
 #pragma pack(push, 1)
+template<typename T>
 struct KeyFrame {
-  KeyFrame(double time, const D3DXMATRIX &mtx) : time(time), mtx(mtx) {}
+  KeyFrame(double time, const T& value) : time(time), value(value) {}
+  double time;
+  T value;
+};
+/*
+struct KeyFrameMtx {
+  KeyFrameMtx(double time, const D3DXMATRIX &mtx) : time(time), mtx(mtx) {}
   double time;
   D3DXMATRIX mtx;
 };
+
+struct KeyFrameFloat {
+  KeyFrameFloat(double time, float value) : time(time), value(value) {}
+  double time;
+  float value;
+};
+
+struct KeyFrameVec3 {
+  KeyFrameVec3(double time, const D3DXVECTOR3 &value) : time(time), value(value) {}
+  double time;
+  D3DXVECTOR3 value;
+};
+*/
+
+
+typedef KeyFrame<float> KeyFrameFloat;
+typedef KeyFrame<D3DXVECTOR3> KeyFrameVec3;
+typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
+
 #pragma pack(pop)
 
 struct Scene {
@@ -482,11 +512,14 @@ private:
   bool process_camera(FbxNode *node, FbxCamera *camera);
   bool process_light(FbxNode *node, FbxLight *light);
 
-  bool process_animation(FbxNode *node);
+  bool process_animation(FbxNode *node, bool translation_only);
+  bool process_position_animation(FbxNode *node);
 
   bool save_scene(const char *dst);
   bool save_meshes();
   bool save_cameras();
+
+  template<class T> bool save_animations(const map<string, vector<KeyFrame<T>>> &anims);
   bool save_animations();
   bool save_lights();
   bool save_materials();
@@ -510,7 +543,9 @@ private:
   char _indent_buffer[cMaxIndent+1];
 
   vector<string> _errors;
-  map<string, vector<KeyFrame>> _animation;
+  map<string, vector<KeyFrameFloat>> _animation_float;
+  map<string, vector<KeyFrameVec3>> _animation_vec3;
+  map<string, vector<KeyFrameMtx>> _animation_mtx;
   Scene _scene;
   Writer _writer;
 
@@ -637,10 +672,128 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
     add_info("found light: %s", l->name.c_str());
   }
 
-  if (!process_animation(node))
+  if (!process_animation(node, true))
     return false;
 
   return true;
+}
+
+void get_aspect_and_fov(FbxCamera *camera, double *fov_x, double *fov_y, double *aspect) {
+  // crazy amount of code to get the aspect ratio and fov
+  FbxCamera::EAspectRatioMode lCamAspectRatioMode = camera->GetAspectRatioMode();
+  double lAspectX = camera->AspectWidth.Get();
+  double lAspectY = camera->AspectHeight.Get();
+  double lAspectRatio = 1.333333;
+  switch( lCamAspectRatioMode)
+  {
+  case FbxCamera::eWindowSize:
+    lAspectRatio = lAspectX / lAspectY;
+    break;
+  case FbxCamera::eFixedRatio:
+    lAspectRatio = lAspectX;
+
+    break;
+  case FbxCamera::eFixedResolution:
+    lAspectRatio = lAspectX / lAspectY * camera->GetPixelRatio();
+    break;
+  case FbxCamera::eFixedWidth:
+    lAspectRatio = camera->GetPixelRatio() / lAspectY;
+    break;
+  case FbxCamera::eFixedHeight:
+    lAspectRatio = camera->GetPixelRatio() * lAspectX;
+    break;
+  default:
+    break;
+  }
+
+  //get the aperture ratio
+  double lFilmHeight = camera->GetApertureHeight();
+  double lFilmWidth = camera->GetApertureWidth() * camera->GetSqueezeRatio();
+  //here we use Height : Width
+  double lApertureRatio = lFilmHeight / lFilmWidth;
+
+
+  //change the aspect ratio to Height : Width
+  lAspectRatio = 1 / lAspectRatio;
+  //revise the aspect ratio and aperture ratio
+  FbxCamera::EGateFit cameraGateFit = camera->GateFit.Get();
+  switch( cameraGateFit )
+  {
+
+  case FbxCamera::eFitFill:
+    if( lApertureRatio > lAspectRatio)  // the same as eHORIZONTAL_FIT
+    {
+      lFilmHeight = lFilmWidth * lAspectRatio;
+      camera->SetApertureHeight( lFilmHeight);
+      lApertureRatio = lFilmHeight / lFilmWidth;
+    }
+    else if( lApertureRatio < lAspectRatio) //the same as eVERTICAL_FIT
+    {
+      lFilmWidth = lFilmHeight / lAspectRatio;
+      camera->SetApertureWidth( lFilmWidth);
+      lApertureRatio = lFilmHeight / lFilmWidth;
+    }
+    break;
+  case FbxCamera::eFitVertical:
+    lFilmWidth = lFilmHeight / lAspectRatio;
+    camera->SetApertureWidth( lFilmWidth);
+    lApertureRatio = lFilmHeight / lFilmWidth;
+    break;
+  case FbxCamera::eFitHorizontal:
+    lFilmHeight = lFilmWidth * lAspectRatio;
+    camera->SetApertureHeight( lFilmHeight);
+    lApertureRatio = lFilmHeight / lFilmWidth;
+    break;
+  case FbxCamera::eFitStretch:
+    lAspectRatio = lApertureRatio;
+    break;
+  case FbxCamera::eFitOverscan:
+    if( lFilmWidth > lFilmHeight)
+    {
+      lFilmHeight = lFilmWidth * lAspectRatio;
+    }
+    else
+    {
+      lFilmWidth = lFilmHeight / lAspectRatio;
+    }
+    lApertureRatio = lFilmHeight / lFilmWidth;
+    break;
+  case FbxCamera::eFitNone:
+  default:
+    break;
+  }
+  //change the aspect ratio to Width : Height
+  lAspectRatio = 1 / lAspectRatio;
+
+#define HFOV2VFOV(h, ar) (2.0 * atan((ar) * tan( (h * FBXSDK_PI_DIV_180) * 0.5)) * FBXSDK_180_DIV_PI) //ar : aspectY / aspectX
+#define VFOV2HFOV(v, ar) (2.0 * atan((ar) * tan( (v * FBXSDK_PI_DIV_180) * 0.5)) * FBXSDK_180_DIV_PI) //ar : aspectX / aspectY
+
+
+  double lFieldOfViewX = 0.0;
+  double lFieldOfViewY = 0.0;
+  if ( camera->GetApertureMode() == FbxCamera::eVertical)
+  {
+    lFieldOfViewY = camera->FieldOfView.Get();
+    lFieldOfViewX = VFOV2HFOV( lFieldOfViewY, 1 / lApertureRatio);
+  }
+  else if (camera->GetApertureMode() == FbxCamera::eHorizontal)
+  {
+    lFieldOfViewX = camera->FieldOfView.Get(); //get HFOV
+    lFieldOfViewY = HFOV2VFOV( lFieldOfViewX, lApertureRatio);
+  }
+  else if (camera->GetApertureMode() == FbxCamera::eFocalLength)
+  {
+    lFieldOfViewX = camera->ComputeFieldOfView(camera->FocalLength.Get());    //get HFOV
+    lFieldOfViewY = HFOV2VFOV( lFieldOfViewX, lApertureRatio);
+  }
+  else if (camera->GetApertureMode() == FbxCamera::eHorizAndVert) {
+    lFieldOfViewX = camera->FieldOfViewX.Get();
+    lFieldOfViewY = camera->FieldOfViewY.Get();
+  }
+
+  *aspect = lAspectRatio;
+  *fov_x = lFieldOfViewX;
+  *fov_y = lFieldOfViewY;
 }
 
 bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
@@ -653,15 +806,17 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
   FbxCamera::EAspectRatioMode ar_mode = camera->GetAspectRatioMode();
 
+  double fov_x, fov_y, aspect;
+  get_aspect_and_fov(camera, &fov_x, &fov_y, &aspect);
+
   Camera *c = new Camera;
   c->name = node->GetName();
   c->pos = max_to_dx(camera->Position.Get());
   c->target = max_to_dx(camera->InterestPosition.Get());
   c->up = max_to_dx(camera->UpVector.Get());
   c->roll = camera->Roll.Get();
-  c->aspect_ratio = camera->GetApertureWidth() / camera->GetApertureHeight();
-  // convert the horizontal fov to vertical fov
-  c->fov = camera->FieldOfView.Get() / c->aspect_ratio;
+  c->aspect_ratio = (float)aspect;
+  c->fov = (float)fov_y;
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
 
@@ -671,7 +826,16 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
     add_info("found camera: %s", c->name.c_str());
   }
 
-  if (!process_animation(node))
+  if (!process_animation(node, true))
+    return false;
+
+  FbxNode *target = node->GetTarget();
+  if (!target) {
+    add_error("No target found for camera: %s", node->GetName());
+    return false;
+  }
+
+  if (!process_animation(target, true))
     return false;
 
   return true;
@@ -824,12 +988,14 @@ FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex)
   return lPoseMatrix;
 }
 
-bool FbxConverter::process_animation(FbxNode *node) {
+bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   INFO_SCOPE;
 
   FbxAMatrix a = GetGeometry(node);
 
-  vector<KeyFrame> &anims = _animation[node->GetName()];
+  vector<KeyFrameMtx> &mtx_anims = _animation_mtx[node->GetName()];
+  vector<KeyFrameVec3> &vec3_anims = _animation_vec3[node->GetName()];
+
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
   for (int i = 0; i <= num_frames; ++i) {
     FbxTime cur;
@@ -837,7 +1003,11 @@ bool FbxConverter::process_animation(FbxNode *node) {
     cur.SetSecondDouble(cur_time);
     FbxAMatrix m;
     m = GetGlobalPosition(node, cur) * a;
-    anims.push_back(KeyFrame(cur_time, max_to_dx(m)));
+    if (translation_only) {
+      vec3_anims.push_back(KeyFrameVec3(cur_time, max_to_dx2(m.GetT())));
+    } else {
+      mtx_anims.push_back(KeyFrameMtx(cur_time, max_to_dx(m)));
+    }
   }
 
   return true;
@@ -960,7 +1130,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     }
   }
 
-  if (!process_animation(fbx_node))
+  if (!process_animation(fbx_node, false))
     return false;
 
   return true;
@@ -1064,20 +1234,43 @@ void write_vector(const Writer &writer, const FbxDouble4 &v) {
   writer.write((float)v[2]);
 }
 
+template<class T> void prune_animations(map<string, vector<KeyFrame<T>>> *anims) {
+  for (auto it = begin(*anims); it != end(*anims); ) {
+    if (it->second.empty()) {
+      it = anims->erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+template<class T> bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims) {
+
+  _writer.write((int)anims.size());
+
+  for (auto it = begin(anims); it != end(anims); ++it) {
+    const string &node_name = it->first;
+    auto &frames = it->second;
+    _writer.add_deferred_string(node_name);
+    _writer.write((int)frames.size());
+    _writer.write_raw(&frames[0], sizeof(frames[0]) * frames.size());
+  }
+
+  return true;
+}
+
 bool FbxConverter::save_animations() {
   BlockHeader header;
   header.id = BlockId::kAnimation;
   ScopedBlock scoped_block(header, _writer);
 
-  _writer.write((int)_animation.size());
+  prune_animations(&_animation_float);
+  prune_animations(&_animation_vec3);
+  prune_animations(&_animation_mtx);
 
-  for (auto it = begin(_animation); it != end(_animation); ++it) {
-    const string &node_name = it->first;
-    const vector<KeyFrame> &frames = it->second;
-    _writer.add_deferred_string(node_name);
-    _writer.write((int)frames.size());
-    _writer.write_raw(&frames[0], sizeof(KeyFrame) * frames.size());
-  }
+  save_animations<float>(_animation_float);
+  save_animations<D3DXVECTOR3>(_animation_vec3);
+  save_animations<D3DXMATRIX>(_animation_mtx);
 
   return true;
 }
