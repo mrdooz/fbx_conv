@@ -232,6 +232,7 @@ struct MaterialProperty {
   MaterialProperty(const string &name, FbxDouble3 value) : name(name), type(Property::kFloat3) { for (int i = 0; i < 3; ++i) _float[i] = (float)value[i]; _float[3] = 0; }
   MaterialProperty(const string &name, FbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
   string name;
+  string filename;
   Property::Type type;
   union {
     int _int;
@@ -450,26 +451,6 @@ struct KeyFrame {
   double time;
   T value;
 };
-/*
-struct KeyFrameMtx {
-  KeyFrameMtx(double time, const D3DXMATRIX &mtx) : time(time), mtx(mtx) {}
-  double time;
-  D3DXMATRIX mtx;
-};
-
-struct KeyFrameFloat {
-  KeyFrameFloat(double time, float value) : time(time), value(value) {}
-  double time;
-  float value;
-};
-
-struct KeyFrameVec3 {
-  KeyFrameVec3(double time, const D3DXVECTOR3 &value) : time(time), value(value) {}
-  double time;
-  D3DXVECTOR3 value;
-};
-*/
-
 
 typedef KeyFrame<float> KeyFrameFloat;
 typedef KeyFrame<D3DXVECTOR3> KeyFrameVec3;
@@ -841,6 +822,40 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   return true;
 }
 
+FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial * pMaterial,
+                               const char * pPropertyName,
+                               const char * pFactorPropertyName,
+                               string *filename)
+{
+  FbxDouble3 lResult(0, 0, 0);
+  const FbxProperty lProperty = pMaterial->FindProperty(pPropertyName);
+  const FbxProperty lFactorProperty = pMaterial->FindProperty(pFactorPropertyName);
+  if (lProperty.IsValid() && lFactorProperty.IsValid())
+  {
+    lResult = lProperty.Get<FbxDouble3>();
+    double lFactor = lFactorProperty.Get<FbxDouble>();
+    if (lFactor != 1)
+    {
+      lResult[0] *= lFactor;
+      lResult[1] *= lFactor;
+      lResult[2] *= lFactor;
+    }
+  }
+
+  if (lProperty.IsValid())
+  {
+    const int lTextureCount = lProperty.GetSrcObjectCount(FbxFileTexture::ClassId);
+    if (lTextureCount)
+    {
+      if (const FbxFileTexture* lTexture = lProperty.GetSrcObject(FBX_TYPE(FbxFileTexture), 0)) {
+        *filename = lTexture->GetFileName();
+      }
+    }
+  }
+
+  return lResult;
+}
+
 bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
   INFO_SCOPE;
   *material_count = fbx_node->GetMaterialCount();
@@ -861,29 +876,37 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 
     material->technique = "diffuse";
 
-#define ADD_PROP(name, mat) material->properties.push_back(MaterialProperty(#name, mat->name))
+#define ADD_PROP(name, mat) { string filename; \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename)); \
+  prop.filename = filename; \
+  material->properties.push_back(prop); }
+
+#define ADD_PROP_FACTOR(name, factor, mat) { string filename; \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##factor, &filename)); \
+  prop.filename = filename; \
+  material->properties.push_back(prop); }
+
+#define ADD_PROP_WITHOUT_FACTOR(name, mat) { string filename; \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, NULL, &filename)); \
+  prop.filename = filename; \
+  material->properties.push_back(prop); }
 
     bool is_phong = node_material->GetClassId().Is(FbxSurfacePhong::ClassId);
     bool is_lambert = node_material->GetClassId().Is(FbxSurfaceLambert::ClassId);
 
     if (is_lambert || is_phong) {
       FbxSurfaceLambert *mat = (FbxSurfaceLambert *)node_material;
+
       ADD_PROP(Ambient, mat);
-      ADD_PROP(AmbientFactor, mat);
       ADD_PROP(Diffuse, mat);
-      ADD_PROP(DiffuseFactor, mat);
       ADD_PROP(Emissive, mat);
-      ADD_PROP(EmissiveFactor, mat);
-      ADD_PROP(TransparentColor, mat);
-      ADD_PROP(TransparencyFactor, mat);
+      ADD_PROP_FACTOR(TransparentColor, TransparencyFactor, mat);
 
       if (is_phong) {
         FbxSurfacePhong *mat = (FbxSurfacePhong *)node_material;
         ADD_PROP(Specular, mat);
-        ADD_PROP(SpecularFactor, mat);
-        ADD_PROP(Shininess, mat);
+        ADD_PROP_WITHOUT_FACTOR(Shininess, mat);
         ADD_PROP(Reflection, mat);
-        ADD_PROP(ReflectionFactor, mat);
       }
     } else {
       // unknown material
@@ -891,6 +914,8 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
     }
 
 #undef ADD_PROP
+#undef ADD_PROP_FACTOR
+#undef ADD_PROP_WITHOUT_FACTOR
   }
   return true;
 }
