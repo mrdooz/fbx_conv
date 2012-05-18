@@ -2,7 +2,7 @@
 
 #include "stdafx.h"
 
-#define FILE_VERSION 4
+#define FILE_VERSION 5
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -822,31 +822,23 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   return true;
 }
 
-FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial * pMaterial,
-                               const char * pPropertyName,
-                               const char * pFactorPropertyName,
-                               string *filename)
+FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *pPropertyName, const char *pFactorPropertyName, string *filename)
 {
   FbxDouble3 lResult(0, 0, 0);
   const FbxProperty lProperty = pMaterial->FindProperty(pPropertyName);
   const FbxProperty lFactorProperty = pMaterial->FindProperty(pFactorPropertyName);
-  if (lProperty.IsValid() && lFactorProperty.IsValid())
-  {
+  if (lProperty.IsValid() && lFactorProperty.IsValid()) {
     lResult = lProperty.Get<FbxDouble3>();
     double lFactor = lFactorProperty.Get<FbxDouble>();
-    if (lFactor != 1)
-    {
+    if (lFactor != 1) {
       lResult[0] *= lFactor;
       lResult[1] *= lFactor;
       lResult[2] *= lFactor;
     }
   }
 
-  if (lProperty.IsValid())
-  {
-    const int lTextureCount = lProperty.GetSrcObjectCount(FbxFileTexture::ClassId);
-    if (lTextureCount)
-    {
+  if (lProperty.IsValid()) {
+    if (int lTextureCount = lProperty.GetSrcObjectCount(FbxFileTexture::ClassId)) {
       if (const FbxFileTexture* lTexture = lProperty.GetSrcObject(FBX_TYPE(FbxFileTexture), 0)) {
         *filename = lTexture->GetFileName();
       }
@@ -873,8 +865,6 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 
     Material *material = new Material(name);
     _scene.materials.insert(make_pair(name, material));
-
-    material->technique = "diffuse";
 
 #define ADD_PROP(name, mat) { string filename; \
   MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename)); \
@@ -911,6 +901,14 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
     } else {
       // unknown material
       _errors.push_back(to_string("Unknown material type: %s", node_material->GetTypeName()));
+    }
+
+    // If the diffuse property has a texturemap, use the texturemap technique
+    auto it = find_if(begin(material->properties), end(material->properties), [&](const MaterialProperty &prop) {return prop.name == "Diffuse"; });
+    if (it != end(material->properties) && !it->filename.empty()) {
+      material->technique = "texture";
+    } else {
+      material->technique = "diffuse";
     }
 
 #undef ADD_PROP
@@ -1093,7 +1091,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   shared_ptr<Mesh> mesh(new Mesh(fbx_node->GetName()));
   _scene.meshes.push_back(mesh);
 
-  if (g_verbose) {
+  if (g_verbose && polys_by_material.size() > 1) {
     add_info("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
   }
 
@@ -1132,6 +1130,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
           FbxVector2 uv;
           fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
+          // flip the y-coordinate to match DirectX
+          uv[1] = 1 - uv[1];
           cand.uv.push_back(uv);
         }
 
@@ -1403,6 +1403,7 @@ bool FbxConverter::save_materials() {
     for (size_t i = 0; i < mat->properties.size(); ++i) {
       const MaterialProperty &prop = mat->properties[i];
       _writer.add_deferred_string(prop.name);
+      _writer.add_deferred_string(prop.filename);
       _writer.write(prop.type);
       switch (prop.type) {
       case Property::kInt:
