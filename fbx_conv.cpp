@@ -2,7 +2,7 @@
 
 #include "stdafx.h"
 
-#define FILE_VERSION 5
+#define FILE_VERSION 6
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -84,6 +84,18 @@ void assoc_delete(T* t) {
   for (T::iterator it = t->begin(); it != t->end(); ++it)
     delete it->second;
   t->clear();
+}
+
+static void split_path(const char *path, std::string *drive, std::string *dir, std::string *fname, std::string *ext) {
+  char drive_buf[_MAX_DRIVE];
+  char dir_buf[_MAX_DIR];
+  char fname_buf[_MAX_FNAME];
+  char ext_buf[_MAX_EXT];
+  _splitpath(path, drive_buf, dir_buf, fname_buf, ext_buf);
+  if (drive) *drive = drive_buf;
+  if (dir) *dir = dir_buf;
+  if (fname) *fname = fname_buf;
+  if (ext) *ext = ext_buf;
 }
 
 class Writer {
@@ -339,14 +351,15 @@ struct SubMesh {
     kTex1    = 1 << 3,
   };
 
-  SubMesh(const string &material, uint32 vertex_flags) 
-    : material(material), vertex_flags(vertex_flags)
+  SubMesh(const string &name, const string &material, uint32 vertex_flags) 
+    : name(name), material(material), vertex_flags(vertex_flags)
   {
     element_size = vertex_flags & kPos ? sizeof(Vector3) : 0;
     element_size += vertex_flags & kNormal ? sizeof(Vector3) : 0;
     element_size += vertex_flags & kTex0 ? sizeof(Vector2) : 0;
     element_size += vertex_flags & kTex1 ? sizeof(Vector2) : 0;
   }
+  string name;
   string material;
   uint32 vertex_flags;
   uint32 element_size;
@@ -465,15 +478,15 @@ struct Scene {
     seq_delete(&cameras);
   }
 
-  typedef map<string, Material *> Materials;
-  typedef vector<Mesh *> Meshes;
-  typedef vector<Camera *> Cameras;
-  typedef vector<Light *> Lights;
-
-  Cameras cameras;
-  Lights lights;
-  Materials materials;
+  vector<Camera *> cameras;
+  vector<Light *> lights;
+  map<string, Material *> materials;
   vector<shared_ptr<Mesh>> meshes;
+};
+
+struct MaterialInfo {
+  SubMesh *submesh;
+  Material *material;
 };
 
 class FbxConverter {
@@ -504,6 +517,10 @@ private:
   bool save_animations();
   bool save_lights();
   bool save_materials();
+
+  bool save_material_info();
+
+  void copy_texture(string src, string *dst);
 
   void add_error(const char *fmt, ...);
   void add_info(const char *fmt, ...);
@@ -543,6 +560,9 @@ private:
   FbxIOSettings *_settings;
   FbxGeometryConverter *_converter;
   FbxImporter *_importer;
+
+  vector<MaterialInfo> _material_info;
+  string _texture_dst;
 };
 
 FbxConverter::FbxConverter() 
@@ -848,9 +868,31 @@ FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *
   return lResult;
 }
 
+void FbxConverter::copy_texture(string src, string *dst) {
+
+  if (src.empty())
+    return;
+
+  string drive, dir, fname, ext;
+
+  if (_texture_dst.empty()) {
+    split_path(g_dst.c_str(), &drive, &dir, &fname, &ext);
+    _texture_dst = drive + dir + "textures/";
+    CreateDirectory(_texture_dst.c_str(), NULL);
+  }
+
+
+  split_path(src.c_str(), &drive, &dir, &fname, &ext);
+  string dst_path = _texture_dst + fname + ext;
+  CopyFile(src.c_str(), dst_path.c_str(), FALSE);
+
+  *dst = dst_path;
+}
+
 bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
   INFO_SCOPE;
   *material_count = fbx_node->GetMaterialCount();
+
   for (int i = 0; i < *material_count; ++i) {
     FbxSurfaceMaterial *node_material = fbx_node->GetMaterial(i);
     const char *name = node_material->GetName();
@@ -868,17 +910,17 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 
 #define ADD_PROP(name, mat) { string filename; \
   MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename)); \
-  prop.filename = filename; \
+  if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
 #define ADD_PROP_FACTOR(name, factor, mat) { string filename; \
   MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##factor, &filename)); \
-  prop.filename = filename; \
+  if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
 #define ADD_PROP_WITHOUT_FACTOR(name, mat) { string filename; \
   MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, NULL, &filename)); \
-  prop.filename = filename; \
+  if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
     bool is_phong = node_material->GetClassId().Is(FbxSurfacePhong::ClassId);
@@ -915,6 +957,7 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 #undef ADD_PROP_FACTOR
 #undef ADD_PROP_WITHOUT_FACTOR
   }
+
   return true;
 }
 
@@ -1106,9 +1149,18 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     // keep track of the unique vertices
     set<SuperVertex> super_verts;
 
-    SubMesh *sub_mesh = new SubMesh(
-      use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName(), vertex_flags);
+    const string material_name = use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName();
+    string submesh_name = polys_by_material.size() > 1 ? to_string("%s_%d", fbx_node->GetName(), i) : fbx_node->GetName();
+    SubMesh *sub_mesh = new SubMesh(submesh_name, material_name, vertex_flags);
     mesh->sub_meshes.push_back(sub_mesh);
+
+    auto material_it = _scene.materials.find(material_name);
+    if (material_it != end(_scene.materials)) {
+      MaterialInfo info;
+      info.submesh = sub_mesh;
+      info.material = material_it->second;
+      _material_info.push_back(info);
+    }
 
     const PolyIndices &indices = polys_by_material[i];
     for (size_t j = 0; j < indices.size(); ++j) {
@@ -1220,6 +1272,9 @@ bool FbxConverter::save_scene(const char *dst) {
   if (!save_materials())
     return false;
 
+  if (!save_material_info())
+    return false;
+
   header.mesh_ofs = _writer.pos();
   if (!save_meshes())
     return false;
@@ -1306,7 +1361,7 @@ bool FbxConverter::save_cameras() {
   header.id = BlockId::kCameras;
   ScopedBlock scoped_block(header, _writer);
 
-  Scene::Cameras &cameras = _scene.cameras;
+  auto &cameras = _scene.cameras;
 
   _writer.write((int)cameras.size());
   for (size_t i = 0; i < cameras.size(); ++i) {
@@ -1331,7 +1386,7 @@ bool FbxConverter::save_lights() {
   header.id = BlockId::kLights;
   ScopedBlock scoped_block(header, _writer);
 
-  Scene::Lights &lights = _scene.lights;
+  auto &lights = _scene.lights;
 
   _writer.write((int)lights.size());
   for (size_t i = 0; i < lights.size(); ++i) {
@@ -1366,6 +1421,7 @@ bool FbxConverter::save_meshes() {
     _writer.write((int)mesh->sub_meshes.size());
     for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
       SubMesh *sub = mesh->sub_meshes[j];
+      _writer.add_deferred_string(sub->name);
       _writer.add_deferred_string(sub->material);
 
       void *vb, *ib;
@@ -1390,10 +1446,10 @@ bool FbxConverter::save_materials() {
   header.id = BlockId::kMaterials;
   ScopedBlock scoped_block(header, _writer);
 
-  Scene::Materials &materials = _scene.materials;
+  auto &materials = _scene.materials;
 
   _writer.write((int)materials.size());
-  for (Scene::Materials::iterator it = materials.begin(); it != materials.end(); ++it) {
+  for (auto it = begin(materials); it != end(materials); ++it) {
     const Material *mat = it->second;
     _writer.add_deferred_string(mat->name);
     _writer.add_deferred_string(mat->technique);
@@ -1426,6 +1482,34 @@ bool FbxConverter::save_materials() {
   }
   return true;
 }
+
+bool FbxConverter::save_material_info() {
+
+  string drive, dir, fname, ext;
+  split_path(g_dst.c_str(), &drive, &dir, &fname, &ext);
+  FILE *f = fopen((drive + dir + fname + "_materials_default.json").c_str(), "wt");
+
+  fprintf(f, "{\n\t\"material_connections\" : [");
+
+  for (size_t i = 0; i < _material_info.size(); ++i) {
+    auto &cur = _material_info[i];
+    fprintf(f, ",\n\t\t{ \"submesh\" : \"%s\", \"technique\" : \"%s\", \"material\" : \"%s\" }" + (i == 0 ? 1 : 0), 
+      cur.submesh->name.c_str(),
+      cur.material->technique.c_str(),
+      cur.material->name.c_str());
+  }
+
+  for (auto it = begin(_material_info); it != end(_material_info); ++it) {
+    SubMesh *sm = it->submesh;
+    Material *material = it->material;
+  }
+
+  fprintf(f, "\n\t]\n}\n");
+  fclose(f);
+
+  return true;
+}
+
 
 void FbxConverter::add_error(const char *fmt, ...) {
 
