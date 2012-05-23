@@ -2,7 +2,7 @@
 
 #include "stdafx.h"
 
-#define FILE_VERSION 6
+#define FILE_VERSION 7
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -233,6 +233,7 @@ namespace Property {
     kFloat2,
     kFloat3,
     kFloat4,
+    kColor,
     kFloat4x4,
     kInt,
   };
@@ -241,8 +242,21 @@ namespace Property {
 struct MaterialProperty {
   MaterialProperty(const string &name, int value) : name(name), type(Property::kInt), _int(value) {}
   MaterialProperty(const string &name, FbxDouble value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
-  MaterialProperty(const string &name, FbxDouble3 value) : name(name), type(Property::kFloat3) { for (int i = 0; i < 3; ++i) _float[i] = (float)value[i]; _float[3] = 0; }
-  MaterialProperty(const string &name, FbxDouble4 value) : name(name), type(Property::kFloat4) { for (int i = 0; i < 4; ++i) _float[i] = (float)value[i]; }
+  MaterialProperty(const string &name, FbxDouble3 value, bool is_color) 
+    : name(name), type(is_color ? Property::kColor : Property::kFloat3) 
+  { 
+    for (int i = 0; i < 3; ++i) 
+      _float[i] = (float)value[i]; 
+    _float[3] = 0; 
+  }
+
+  MaterialProperty(const string &name, FbxDouble4 value, bool is_color) 
+    : name(name), type(is_color ? Property::kColor : Property::kFloat4) 
+  { 
+    for (int i = 0; i < 4; ++i) 
+      _float[i] = (float)value[i]; 
+  }
+
   string name;
   string filename;
   Property::Type type;
@@ -472,15 +486,10 @@ typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
 #pragma pack(pop)
 
 struct Scene {
-  ~Scene() {
-    assoc_delete(&materials);
-    seq_delete(&lights);
-    seq_delete(&cameras);
-  }
-
-  vector<Camera *> cameras;
-  vector<Light *> lights;
-  map<string, Material *> materials;
+  vector<shared_ptr<Camera>> cameras;
+  vector<shared_ptr<Light>> lights;
+  map<string, Material *> materials_by_name;
+  vector<shared_ptr<Material>> materials;
   vector<shared_ptr<Mesh>> meshes;
 };
 
@@ -647,7 +656,9 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   add_info("===================================================================");
   bool res = convert_inner(src, dst);
 
-  copy(RANGE(_errors), ostream_iterator<string>(cout));
+  for (auto it = begin(_errors); it != end(_errors); ++it) {
+    cout << *it << endl;
+  }
 
   return res;
 }
@@ -667,7 +678,7 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
   l->pos = max_to_dx(FbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
   l->color = light->Color.Get();
 
-  _scene.lights.push_back(l);
+  _scene.lights.emplace_back(shared_ptr<Light>(l));
 
   if (g_verbose) {
     add_info("found light: %s", l->name.c_str());
@@ -821,7 +832,7 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
 
-  _scene.cameras.push_back(c);
+  _scene.cameras.emplace_back(shared_ptr<Camera>(c));
 
   if (g_verbose) {
     add_info("found camera: %s", c->name.c_str());
@@ -898,7 +909,7 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
     const char *name = node_material->GetName();
 
     // Skip if we've already seen this material
-    if (_scene.materials.find(name) != _scene.materials.end())
+    if (_scene.materials_by_name.find(name) != _scene.materials_by_name.end())
       continue;
 
     if (g_verbose) {
@@ -906,20 +917,29 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
     }
 
     Material *material = new Material(name);
-    _scene.materials.insert(make_pair(name, material));
+    _scene.materials_by_name.insert(make_pair(name, material));
+    _scene.materials.push_back(shared_ptr<Material>(material));
 
 #define ADD_PROP(name, mat) { string filename; \
-  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename)); \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename), true); \
   if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
 #define ADD_PROP_FACTOR(name, factor, mat) { string filename; \
-  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##factor, &filename)); \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##factor, &filename), true); \
   if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
+#define ADD_PROP_FLOAT(name, mat) { \
+  const FbxProperty lProperty = mat->FindProperty(FbxSurfaceMaterial::s##name); \
+  if (lProperty.IsValid()) { \
+    MaterialProperty prop(#name, lProperty.Get<FbxDouble>()); \
+    material->properties.push_back(prop); \
+  } \
+}
+
 #define ADD_PROP_WITHOUT_FACTOR(name, mat) { string filename; \
-  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, NULL, &filename)); \
+  MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, NULL, &filename), true); \
   if (!filename.empty()) { copy_texture(filename, &prop.filename); } \
   material->properties.push_back(prop); }
 
@@ -937,7 +957,7 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
       if (is_phong) {
         FbxSurfacePhong *mat = (FbxSurfacePhong *)node_material;
         ADD_PROP(Specular, mat);
-        ADD_PROP_WITHOUT_FACTOR(Shininess, mat);
+        ADD_PROP_FLOAT(Shininess, mat);
         ADD_PROP(Reflection, mat);
       }
     } else {
@@ -1154,8 +1174,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     SubMesh *sub_mesh = new SubMesh(submesh_name, material_name, vertex_flags);
     mesh->sub_meshes.push_back(sub_mesh);
 
-    auto material_it = _scene.materials.find(material_name);
-    if (material_it != end(_scene.materials)) {
+    auto material_it = _scene.materials_by_name.find(material_name);
+    if (material_it != end(_scene.materials_by_name)) {
       MaterialInfo info;
       info.submesh = sub_mesh;
       info.material = material_it->second;
@@ -1365,7 +1385,7 @@ bool FbxConverter::save_cameras() {
 
   _writer.write((int)cameras.size());
   for (size_t i = 0; i < cameras.size(); ++i) {
-    Camera *camera = cameras[i];
+    auto camera = cameras[i];
     _writer.add_deferred_string(camera->name);
     write_vector(_writer, camera->pos);
     write_vector(_writer, camera->target);
@@ -1390,7 +1410,7 @@ bool FbxConverter::save_lights() {
 
   _writer.write((int)lights.size());
   for (size_t i = 0; i < lights.size(); ++i) {
-    Light *light = lights[i];
+    auto light = lights[i];
     _writer.add_deferred_string(light->name);
     write_vector(_writer, light->pos);
     write_vector(_writer, light->color);
@@ -1448,8 +1468,8 @@ bool FbxConverter::save_materials() {
 
   auto &materials = _scene.materials;
 
-  _writer.write((int)materials.size());
-  for (auto it = begin(materials); it != end(materials); ++it) {
+  _writer.write((int)_scene.materials_by_name.size());
+  for (auto it = begin(_scene.materials_by_name); it != end(_scene.materials_by_name); ++it) {
     const Material *mat = it->second;
     _writer.add_deferred_string(mat->name);
     _writer.add_deferred_string(mat->technique);
@@ -1462,25 +1482,37 @@ bool FbxConverter::save_materials() {
       _writer.add_deferred_string(prop.filename);
       _writer.write(prop.type);
       switch (prop.type) {
-      case Property::kInt:
-        _writer.write(prop._int);
-        break;
-      case Property::kFloat:
-        _writer.write_raw(&prop._float[0], sizeof(float));
-        break;
-      case Property::kFloat3:
-        _writer.write_raw(&prop._float[0], 3 * sizeof(float));
-        break;
-      case Property::kFloat4:
-        _writer.write_raw(&prop._float[0], 4 * sizeof(float));
-        break;
-      default:
-        _errors.push_back("Unknown property type exporting materials");
-        break;
-      }
+        case Property::kInt:
+          _writer.write(prop._int);
+          break;
+        case Property::kFloat:
+          _writer.write_raw(&prop._float[0], sizeof(float));
+          break;
+        case Property::kFloat3:
+          _writer.write_raw(&prop._float[0], 3 * sizeof(float));
+          break;
+        case Property::kFloat4:
+        case Property::kColor:
+          _writer.write_raw(&prop._float[0], 4 * sizeof(float));
+          break;
+        default:
+          add_error("Unknown property type exporting materials");
+          break;
+        }
     }
   }
   return true;
+}
+
+static string type_to_string(Property::Type type) {
+  switch (type) {
+    case Property::kInt: return "int";
+    case Property::kFloat: return "float";
+    case Property::kColor: return "color";
+    case Property::kFloat3: return "float3";
+    case Property::kFloat4: return "float4";
+  }
+  return "unknown";
 }
 
 bool FbxConverter::save_material_info() {
@@ -1504,7 +1536,47 @@ bool FbxConverter::save_material_info() {
     Material *material = it->material;
   }
 
-  fprintf(f, "\n\t]\n}\n");
+  fprintf(f, "\n\t],\n\n");
+
+  fprintf(f, "\t\"materials\" : [\n");
+
+  auto &materials = _scene.materials;
+  size_t num_mats = materials.size();
+  for (size_t i = 0; i < num_mats; ++i) {
+    auto mat = materials[i];
+    fprintf(f, "\t\t{\n\t\t\t\"name\" : \"%s\", \n", mat->name.c_str());
+    fprintf(f, "\t\t\t\"properties\" : [\n");
+
+    // write the properties for the material
+    size_t num_props = mat->properties.size();
+    for (size_t j = 0; j < num_props; ++j) {
+      const MaterialProperty &prop = mat->properties[j];
+      fprintf(f, "\t\t\t\t{\n");
+      fprintf(f, "\t\t\t\t\t\"name\" : \"%s\",\n", prop.name.c_str());
+      fprintf(f, "\t\t\t\t\t\"type\" : \"%s\",\n", type_to_string(prop.type).c_str());
+      fprintf(f, "\t\t\t\t\t\"value\" : ");
+      switch (prop.type) {
+        case Property::kFloat: {
+          fprintf(f, "{ \"x\" : %f }\n", prop._float[0]);
+          break;
+        }
+
+        case Property::kColor: {
+          fprintf(f, "{\n\t\t\t\t\t\t\"r\" : %f, \n", prop._float[0]);
+          fprintf(f, "\t\t\t\t\t\t\"g\" : %f, \n", prop._float[1]);
+          fprintf(f, "\t\t\t\t\t\t\"b\" : %f, \n", prop._float[2]);
+          fprintf(f, "\t\t\t\t\t\t\"a\" : %f\n\t\t\t\t\t}\n", prop._float[3]);
+          break;
+        }
+      }
+      fprintf(f, "\t\t\t\t}%s\n", (j != num_props - 1) ? "," : "\n\t\t\t]");
+    }
+    fprintf(f, "\t\t}%s\n", (i != num_mats - 1) ? "," : "");
+  }
+
+  fprintf(f, "\t]");
+    
+  fprintf(f, "\n}\n");
   fclose(f);
 
   return true;
