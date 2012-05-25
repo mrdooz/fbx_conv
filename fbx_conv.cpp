@@ -2,7 +2,7 @@
 
 #include "stdafx.h"
 
-#define FILE_VERSION 7
+#define FILE_VERSION 8
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -441,7 +441,8 @@ struct Camera {
   FbxDouble3 pos, target, up;
   FbxDouble roll;
   FbxDouble aspect_ratio;
-  FbxDouble fov;
+  FbxDouble fov_x;
+  FbxDouble fov_y;
   FbxDouble near_plane, far_plane;
 };
 
@@ -828,7 +829,8 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   c->up = max_to_dx(camera->UpVector.Get());
   c->roll = camera->Roll.Get();
   c->aspect_ratio = (float)aspect;
-  c->fov = (float)fov_y;
+  c->fov_x = (float)fov_x;
+  c->fov_y = (float)fov_y;
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
 
@@ -1392,7 +1394,8 @@ bool FbxConverter::save_cameras() {
     write_vector(_writer, camera->up);
     _writer.write((float)camera->roll);
     _writer.write((float)camera->aspect_ratio);
-    _writer.write((float)camera->fov);
+    _writer.write((float)camera->fov_x);
+    _writer.write((float)camera->fov_y);
     _writer.write((float)camera->near_plane);
     _writer.write((float)camera->far_plane);
   };
