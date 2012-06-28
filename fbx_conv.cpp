@@ -899,7 +899,8 @@ void FbxConverter::copy_texture(string src, string *dst) {
   string dst_path = _texture_dst + fname + ext;
   CopyFile(src.c_str(), dst_path.c_str(), FALSE);
 
-  *dst = dst_path;
+  // make the dst-path relative the .fbx file
+  *dst = "textures/" + fname + ext;
 }
 
 bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
@@ -1547,32 +1548,36 @@ bool FbxConverter::save_material_info() {
   size_t num_mats = materials.size();
   for (size_t i = 0; i < num_mats; ++i) {
     auto mat = materials[i];
-    fprintf(f, "\t\t{\n\t\t\t\"name\" : \"%s\", \n", mat->name.c_str());
-    fprintf(f, "\t\t\t\"properties\" : [\n");
-
-    // write the properties for the material
     size_t num_props = mat->properties.size();
-    for (size_t j = 0; j < num_props; ++j) {
-      const MaterialProperty &prop = mat->properties[j];
-      fprintf(f, "\t\t\t\t{\n");
-      fprintf(f, "\t\t\t\t\t\"name\" : \"%s\",\n", prop.name.c_str());
-      fprintf(f, "\t\t\t\t\t\"type\" : \"%s\",\n", type_to_string(prop.type).c_str());
-      fprintf(f, "\t\t\t\t\t\"value\" : ");
-      switch (prop.type) {
-        case Property::kFloat: {
-          fprintf(f, "{ \"x\" : %f }\n", prop._float[0]);
-          break;
-        }
+    fprintf(f, "\t\t{\n\t\t\t\"name\" : \"%s\"%s\n", mat->name.c_str(), num_props ? ", " : "");
 
-        case Property::kColor: {
-          fprintf(f, "{\n\t\t\t\t\t\t\"r\" : %f, \n", prop._float[0]);
-          fprintf(f, "\t\t\t\t\t\t\"g\" : %f, \n", prop._float[1]);
-          fprintf(f, "\t\t\t\t\t\t\"b\" : %f, \n", prop._float[2]);
-          fprintf(f, "\t\t\t\t\t\t\"a\" : %f\n\t\t\t\t\t}\n", prop._float[3]);
-          break;
+    if (num_props) {
+      fprintf(f, "\t\t\t\"properties\" : [\n");
+
+      // write the properties for the material
+      for (size_t j = 0; j < num_props; ++j) {
+        const MaterialProperty &prop = mat->properties[j];
+        fprintf(f, "\t\t\t\t{\n");
+        fprintf(f, "\t\t\t\t\t\"name\" : \"%s\",\n", prop.name.c_str());
+        fprintf(f, "\t\t\t\t\t\"type\" : \"%s\",\n", type_to_string(prop.type).c_str());
+        fprintf(f, "\t\t\t\t\t\"value\" : ");
+
+        switch (prop.type) {
+          case Property::kFloat: {
+            fprintf(f, "{ \"x\" : %f }\n", prop._float[0]);
+            break;
+          }
+
+          case Property::kColor: {
+            fprintf(f, "{\n\t\t\t\t\t\t\"r\" : %f, \n", prop._float[0]);
+            fprintf(f, "\t\t\t\t\t\t\"g\" : %f, \n", prop._float[1]);
+            fprintf(f, "\t\t\t\t\t\t\"b\" : %f, \n", prop._float[2]);
+            fprintf(f, "\t\t\t\t\t\t\"a\" : %f\n\t\t\t\t\t}\n", prop._float[3]);
+            break;
+          }
         }
+        fprintf(f, "\t\t\t\t}%s\n", (j != num_props - 1) ? "," : "\n\t\t\t]");
       }
-      fprintf(f, "\t\t\t\t}%s\n", (j != num_props - 1) ? "," : "\n\t\t\t]");
     }
     fprintf(f, "\t\t}%s\n", (i != num_mats - 1) ? "," : "");
   }
