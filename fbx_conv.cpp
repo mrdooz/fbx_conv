@@ -1,12 +1,9 @@
 // converter between .fbx and .kumi format
 
 #include "stdafx.h"
+#include "fbx_conv.hpp"
+#include "utils.hpp"
 
-#define FILE_VERSION 8
-
-typedef uint8_t uint8;
-typedef uint16_t uint16;
-typedef uint32_t uint32;
 
 using namespace std;
 using namespace stdext;
@@ -27,13 +24,6 @@ HANDLE g_quit_event;
 const int WM_USER_CONVERT_FILE = WM_USER + 1;
 const int FILE_CHANGED_TIMER_ID = 1;
 
-#define SAFE_DELETE(x) if( (x) != 0 ) { delete (x); (x) = 0; }
-
-#define GEN_NAME2(prefix, line) prefix##line
-#define GEN_NAME(prefix, line) GEN_NAME2(prefix, line)
-#define MAKE_SCOPED(type) type GEN_NAME(ANON, __COUNTER__)
-
-#define RANGE(x) begin(x), end(x)
 
 #if _DEBUG
 #pragma comment(lib, "fbxsdk-2013.1-mdd.lib")
@@ -43,270 +33,6 @@ const int FILE_CHANGED_TIMER_ID = 1;
 
 #pragma comment(lib, "d3dx10.lib")
 
-
-#pragma pack(push, 1)
-struct MainHeader {
-  int version;
-  int material_ofs;
-  int mesh_ofs;
-  int light_ofs;
-  int camera_ofs;
-  int animation_ofs;
-  int binary_ofs;
-  int total_size;
-};
-
-namespace BlockId {
-  enum Enum {
-    kMaterials,
-    kMeshes,
-    kCameras,
-    kLights,
-    kAnimation,
-  };
-}
-
-struct BlockHeader {
-  BlockId::Enum id;
-  int size;	// size excl header
-};
-#pragma pack(pop)
-
-template<class T> 
-void seq_delete(T* t) {
-  for (auto it = t->begin(); it != t->end(); ++it)
-    delete *it;
-  t->clear();
-}
-
-template<class T> 
-void assoc_delete(T* t) {
-  for (T::iterator it = t->begin(); it != t->end(); ++it)
-    delete it->second;
-  t->clear();
-}
-
-static void split_path(const char *path, std::string *drive, std::string *dir, std::string *fname, std::string *ext) {
-  char drive_buf[_MAX_DRIVE];
-  char dir_buf[_MAX_DIR];
-  char fname_buf[_MAX_FNAME];
-  char ext_buf[_MAX_EXT];
-  _splitpath(path, drive_buf, dir_buf, fname_buf, ext_buf);
-  if (drive) *drive = drive_buf;
-  if (dir) *dir = dir_buf;
-  if (fname) *fname = fname_buf;
-  if (ext) *ext = ext_buf;
-}
-
-class Writer {
-public:
-  Writer() : _f(nullptr) {}
-  ~Writer() {
-    if (_f)
-      fclose(_f);
-  }
-
-  struct DeferredBinary {
-    DeferredBinary(int ofs, const void *d, int len, bool save_len)
-      : ofs(ofs)
-      , save_len(save_len) {
-        data.resize(len);
-        memcpy(&data[0], d, len);
-    }
-    int ofs;
-    bool save_len;
-    vector<uint8> data;
-  };
-
-  bool open(const char *filename) {
-    if (!(_f = fopen(filename, "wb")))
-      return false;
-    return true;
-  }
-
-  void close() {
-    fclose(_f);
-  }
-
-  void add_deferred_string(const string &str) {
-    int p = pos();
-    _deferred_binary.push_back(DeferredBinary(p, str.data(), str.size() + 1, false));
-    write(p);
-  }
-
-  void add_deferred_binary(void *data, int len) {
-    int p = pos();
-    _deferred_binary.push_back(DeferredBinary(p, data, len, true));
-    write(p);
-  }
-
-  void save_binary() {
-    // we assume that the binary data is going to be transient,
-    // so all the offsets are relative the binary block
-    int binary_start = pos();
-    write((int)_deferred_binary.size());
-    for (size_t i = 0; i < _deferred_binary.size(); ++i)
-      write(_deferred_binary[i].ofs);
-
-    for (size_t i = 0; i < _deferred_binary.size(); ++i) {
-      // the offset is relative the start of the binary block
-      auto &cur = _deferred_binary[i];
-      int ofs = pos() - binary_start;
-      int len = (int)cur.data.size();
-      if (cur.save_len)
-        write(len);
-      write_raw(&cur.data[0], len);
-      push_pos();
-      set_pos(cur.ofs);
-      write(ofs);
-      pop_pos();
-    }
-  }
-
-  template <class T>
-  void write(const T& data) const {
-    fwrite(&data, 1, sizeof(T), _f);
-  }
-
-  void write_raw(const void *data, int len) {
-    fwrite(data, 1, len, _f);
-  }
-
-  void push_pos() {
-    _file_pos_stack.push_back(ftell(_f));
-  }
-
-  void pop_pos() {
-    assert(!_file_pos_stack.empty());
-    int p = _file_pos_stack.back();
-    _file_pos_stack.pop_back();
-    fseek(_f, p, SEEK_SET);
-  }
-
-  int pos() {
-    return ftell(_f);
-  }
-
-  void set_pos(int p) {
-    fseek(_f, p, SEEK_SET);
-  }
-
-  void push_exch() {
-    // push the current position, and move to the last position on the stack
-    assert(!_file_pos_stack.empty());
-
-    int p = ftell(_f);
-    pop_pos();
-    _file_pos_stack.push_back(p);
-  }
-
-private:
-  vector<DeferredBinary> _deferred_binary;
-
-  deque<int> _file_pos_stack;
-  FILE *_f;
-};
-
-struct ScopedBlock {
-  ScopedBlock(BlockHeader &header, Writer &writer) : header(header), writer(writer) {
-    writer.push_pos();
-    writer.write(header);
-    block_start = writer.pos();
-  }
-
-  ~ScopedBlock() {
-    header.size = writer.pos() - block_start;
-    writer.push_exch();
-    writer.write(header);
-    writer.pop_pos();
-  }
-
-  BlockHeader &header;
-  Writer &writer;
-  int block_start;
-};
-
-namespace Property {
-  enum Type {
-    kUnknown,
-    kFloat,
-    kFloat2,
-    kFloat3,
-    kFloat4,
-    kColor,
-    kFloat4x4,
-    kInt,
-  };
-}
-
-struct MaterialProperty {
-  MaterialProperty(const string &name, int value) : name(name), type(Property::kInt), _int(value) {}
-  MaterialProperty(const string &name, FbxDouble value) : name(name), type(Property::kFloat) { _float[0] = (float)value; }
-  MaterialProperty(const string &name, FbxDouble3 value, bool is_color) 
-    : name(name), type(is_color ? Property::kColor : Property::kFloat3) 
-  { 
-    for (int i = 0; i < 3; ++i) 
-      _float[i] = (float)value[i]; 
-    _float[3] = 0; 
-  }
-
-  MaterialProperty(const string &name, FbxDouble4 value, bool is_color) 
-    : name(name), type(is_color ? Property::kColor : Property::kFloat4) 
-  { 
-    for (int i = 0; i < 4; ++i) 
-      _float[i] = (float)value[i]; 
-  }
-
-  string name;
-  string filename;
-  Property::Type type;
-  union {
-    int _int;
-    float _float[4];
-  };
-};
-
-struct Material {
-  Material(const string &name) : name(name) {}
-  string name;
-  string technique;
-  vector<MaterialProperty> properties;
-};
-
-struct SuperVertex {
-  SuperVertex(const FbxVector4 &pos, const FbxVector4 &normal) : pos(pos), normal(normal), idx(-1) {}
-  FbxVector4 pos;
-  FbxVector4 normal;
-  vector<FbxVector2> uv;
-  int idx;
-
-  friend bool operator<(const SuperVertex &a, const SuperVertex &b) {
-    // strict weak ordering
-    for (int i = 0; i < 3; ++i) {
-      if (a.pos[i] < b.pos[i]) 
-        return true;
-      if (b.pos[i] < a.pos[i])
-        return false;
-    }
-
-    for (int i = 0; i < 3; ++i) {
-      if (a.normal[i] < b.normal[i])
-        return true;
-      if (b.normal[i] < a.normal[i])
-        return false;
-    }
-
-    for (size_t i = 0; i < a.uv.size(); ++i) {
-      for (int j = 0; j < 2; ++j) {
-        if (a.uv[i][j] < b.uv[i][j])
-          return true;
-        if (b.uv[i][j] < a.uv[i][j])
-          return false;
-      }
-    }
-    return false;
-  }
-};
 
 
 #if USE_DIRECTX_SYSTEM
@@ -344,55 +70,6 @@ D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
 }
 
-struct Vector2 {
-  Vector2() {}
-  Vector2(const FbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
-  float x, y;
-};
-
-struct Vector3 {
-  Vector3() {}
-  Vector3(const FbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
-  float x, y, z;
-};
-
-struct SubMesh {
-
-  enum VertexFlags {
-    kPos     = 1 << 0,
-    kNormal  = 1 << 1,
-    kTex0    = 1 << 2,
-    kTex1    = 1 << 3,
-  };
-
-  SubMesh(const string &name, const string &material, uint32 vertex_flags) 
-    : name(name), material(material), vertex_flags(vertex_flags)
-  {
-    element_size = vertex_flags & kPos ? sizeof(Vector3) : 0;
-    element_size += vertex_flags & kNormal ? sizeof(Vector3) : 0;
-    element_size += vertex_flags & kTex0 ? sizeof(Vector2) : 0;
-    element_size += vertex_flags & kTex1 ? sizeof(Vector2) : 0;
-  }
-  string name;
-  string material;
-  uint32 vertex_flags;
-  uint32 element_size;
-  vector<Vector3> pos;
-  vector<Vector3> normal;
-  vector<Vector2> tex0;
-  vector<Vector2> tex1;
-  vector<uint32> indices;
-};
-
-template<typename T>
-T max3(const T &a, const T &b, const T &c) {
-  return max(a, max(b, c));
-}
-
-template<typename T>
-T max4(const T &a, const T &b, const T &c, const T &d) {
-  return max(a, max3(b, c, d));
-}
 
 void compact_vertex_data(const SubMesh &submesh, void **data, int *len) {
   *len = submesh.element_size * submesh.pos.size();
@@ -425,155 +102,7 @@ void compact_index_data(const SubMesh &submesh, void **data, int *len, int *inde
     copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
 }
 
-struct Mesh {
-  Mesh(const string &name) : name(name) {}
-  ~Mesh() {
-    seq_delete(&sub_meshes);
-  }
-  string name;
-  D3DXMATRIX obj_to_world;
-  vector<SubMesh *> sub_meshes;
-};
 
-
-struct Camera {
-  string name;
-  FbxDouble3 pos, target, up;
-  FbxDouble roll;
-  FbxDouble aspect_ratio;
-  FbxDouble fov_x;
-  FbxDouble fov_y;
-  FbxDouble near_plane, far_plane;
-};
-
-struct Light {
-  enum Type {
-    Omni,
-    Directional,
-    Spot
-  };
-
-  enum Decay {
-    None,
-    Linear,
-    Quadratic,
-    Cubic,
-  };
-
-  string name;
-  Type type;
-  Decay decay;
-  FbxDouble3 pos;
-  FbxDouble3 color;
-  FbxDouble intensity;
-};
-
-struct Hierarchy {
-
-};
-
-#pragma pack(push, 1)
-template<typename T>
-struct KeyFrame {
-  KeyFrame(double time, const T& value) : time(time), value(value) {}
-  double time;
-  T value;
-};
-
-typedef KeyFrame<float> KeyFrameFloat;
-typedef KeyFrame<D3DXVECTOR3> KeyFrameVec3;
-typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
-
-#pragma pack(pop)
-
-struct Scene {
-  vector<shared_ptr<Camera>> cameras;
-  vector<shared_ptr<Light>> lights;
-  map<string, Material *> materials_by_name;
-  vector<shared_ptr<Material>> materials;
-  vector<shared_ptr<Mesh>> meshes;
-};
-
-struct MaterialInfo {
-  SubMesh *submesh;
-  Material *material;
-};
-
-class FbxConverter {
-public:
-  FbxConverter();
-  ~FbxConverter();
-  bool convert(const char *src, const char *dst);
-private:
-
-  bool convert_inner(const char *src, const char *dst);
-
-  // like a CSI!
-  bool process_scene(FbxScene *scene);
-
-  bool process_mesh(FbxNode *node, FbxMesh *mesh);
-  bool process_material(FbxNode *node, int *material_count);
-  bool process_camera(FbxNode *node, FbxCamera *camera);
-  bool process_light(FbxNode *node, FbxLight *light);
-
-  bool process_animation(FbxNode *node, bool translation_only);
-  bool process_position_animation(FbxNode *node);
-
-  bool save_scene(const char *dst);
-  bool save_meshes();
-  bool save_cameras();
-
-  template<class T> bool save_animations(const map<string, vector<KeyFrame<T>>> &anims);
-  bool save_animations();
-  bool save_lights();
-  bool save_materials();
-
-  bool save_material_info();
-
-  void copy_texture(string src, string *dst);
-
-  void add_error(const char *fmt, ...);
-  void add_info(const char *fmt, ...);
-
-  static const int cIndentLevel = 4;
-  static const int cMaxIndent = 512;
-  void enter_scope() { _indent_level += cIndentLevel; }
-  void leave_scope() { _indent_level -= cIndentLevel; }
-
-  struct InfoScope {
-    InfoScope() { g_converter->enter_scope(); }
-    ~InfoScope() { g_converter->leave_scope(); }
-  };
-
-#define INFO_SCOPE MAKE_SCOPED(InfoScope);
-
-  int _indent_level;
-  char _indent_buffer[cMaxIndent+1];
-
-  vector<string> _errors;
-  map<string, vector<KeyFrameFloat>> _animation_float;
-  map<string, vector<KeyFrameVec3>> _animation_vec3;
-  map<string, vector<KeyFrameMtx>> _animation_mtx;
-  Scene _scene;
-  Writer _writer;
-
-  FbxTime _start_time;
-  FbxTime _stop_time;
-
-  FbxLongLong _duration_ms;
-  double _duration;
-  double _fps;
-
-  FbxAnimEvaluator *_evaluator;
-  FbxScene *_fbx_scene;
-  FbxManager *_mgr;
-  FbxIOSettings *_settings;
-  FbxGeometryConverter *_converter;
-  FbxImporter *_importer;
-
-  vector<MaterialInfo> _material_info;
-  string _texture_dst;
-};
 
 FbxConverter::FbxConverter() 
   : _mgr(FbxManager::Create())
@@ -582,6 +111,7 @@ FbxConverter::FbxConverter()
   , _importer(FbxImporter::Create(_mgr, ""))
   , _indent_level(0)
   , _evaluator(nullptr)
+  , _writer(new Writer)
 {
   memset(_indent_buffer, ' ', cMaxIndent);
   _indent_buffer[cMaxIndent] = '\0';
@@ -626,6 +156,7 @@ bool FbxConverter::convert_inner(const char *src, const char *dst) {
   _duration = time_span.GetDuration().GetSecondDouble();
   _duration_ms = time_span.GetDuration().GetMilliSeconds();
   _fps = time_span.GetDuration().GetFrameRate(time_mode);
+  _scene.ambient = global_settings.GetAmbientColor();
 
   auto axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
 
@@ -664,25 +195,34 @@ bool FbxConverter::convert(const char *src, const char *dst) {
   return res;
 }
 
-bool FbxConverter::process_light(FbxNode *node, FbxLight *light) {
+bool FbxConverter::process_light(FbxNode *node, FbxLight *fbx_light) {
 
   INFO_SCOPE;
 
-  if (!light->CastLight.Get())
+  if (!fbx_light->CastLight.Get())
     return true;
 
   FbxAnimEvaluator *evaluator = _fbx_scene->GetEvaluator();
 
-  Light *l = new Light;
-  l->name = node->GetName();
+  Light *light = new Light;
+  light->name = node->GetName();
   FbxMatrix mtx = evaluator->GetNodeGlobalTransform(node);
-  l->pos = max_to_dx(FbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
-  l->color = light->Color.Get();
+  light->pos = max_to_dx(FbxDouble3(mtx.Get(3,0), mtx.Get(3,1), mtx.Get(3,2)));
+  light->color = fbx_light->Color.Get();
+  light->intensity = fbx_light->Intensity.Get();
 
-  _scene.lights.emplace_back(shared_ptr<Light>(l));
+  light->use_near_attenuation = fbx_light->EnableNearAttenuation.Get();
+  light->near_attenuation_start = fbx_light->NearAttenuationStart.Get();
+  light->near_attenuation_end = fbx_light->NearAttenuationEnd.Get();
+
+  light->use_far_attenuation = fbx_light->EnableFarAttenuation.Get();
+  light->far_attenuation_start = fbx_light->FarAttenuationStart.Get();
+  light->far_attenuation_end = fbx_light->FarAttenuationEnd.Get();
+
+  _scene.lights.emplace_back(shared_ptr<Light>(light));
 
   if (g_verbose) {
-    add_info("found light: %s", l->name.c_str());
+    add_info("found light: %s", light->name.c_str());
   }
 
   if (!process_animation(node, true))
@@ -1175,7 +715,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     const string material_name = use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName();
     string submesh_name = polys_by_material.size() > 1 ? to_string("%s_%d", fbx_node->GetName(), i) : fbx_node->GetName();
     SubMesh *sub_mesh = new SubMesh(submesh_name, material_name, vertex_flags);
-    mesh->sub_meshes.push_back(sub_mesh);
+    mesh->sub_meshes.push_back(std::unique_ptr<SubMesh>(sub_mesh));
 
     auto material_it = _scene.materials_by_name.find(material_name);
     if (material_it != end(_scene.materials_by_name)) {
@@ -1283,44 +823,48 @@ bool FbxConverter::save_scene(const char *dst) {
   // the scene is saved so it can be read in a single sequential read,
   // and then a simple fixup applied to the pointers
 
-  if (!_writer.open(dst))
+  if (!_writer->open(dst))
     return false;
 
   MainHeader header;
   header.version = FILE_VERSION;
-  _writer.push_pos();
-  _writer.write(header);
+  _writer->push_pos();
+  _writer->write(header);
 
-  header.material_ofs = _writer.pos();
+  header.global_ofs = _writer->pos();
+  if (!save_globals())
+    return false;
+
+  header.material_ofs = _writer->pos();
   if (!save_materials())
     return false;
 
   if (!save_material_info())
     return false;
 
-  header.mesh_ofs = _writer.pos();
+  header.mesh_ofs = _writer->pos();
   if (!save_meshes())
     return false;
 
-  header.light_ofs = _writer.pos();
+  header.light_ofs = _writer->pos();
   if (!save_lights())
     return false;
 
-  header.camera_ofs = _writer.pos();
+  header.camera_ofs = _writer->pos();
   if (!save_cameras())
     return false;
 
-  header.animation_ofs = _writer.pos();
+  header.animation_ofs = _writer->pos();
   if (!save_animations())
     return false;
 
-  header.binary_ofs = _writer.pos();
-  _writer.save_binary();
-  header.total_size = _writer.pos();
+  header.binary_ofs = _writer->pos();
+  _writer->save_binary();
+  header.total_size = _writer->pos();
 
-  _writer.push_exch();
-  _writer.write(header);
-  _writer.pop_pos();
+  _writer->push_exch();
+  _writer->write(header);
+  _writer->pop_pos();
 
   return true;
 }
@@ -1349,14 +893,14 @@ template<class T> void prune_animations(map<string, vector<KeyFrame<T>>> *anims)
 
 template<class T> bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims) {
 
-  _writer.write((int)anims.size());
+  _writer->write((int)anims.size());
 
   for (auto it = begin(anims); it != end(anims); ++it) {
     const string &node_name = it->first;
     auto &frames = it->second;
-    _writer.add_deferred_string(node_name);
-    _writer.write((int)frames.size());
-    _writer.write_raw(&frames[0], sizeof(frames[0]) * frames.size());
+    _writer->add_deferred_string(node_name);
+    _writer->write((int)frames.size());
+    _writer->write_raw(&frames[0], sizeof(frames[0]) * frames.size());
   }
 
   return true;
@@ -1365,7 +909,7 @@ template<class T> bool FbxConverter::save_animations(const map<string, vector<Ke
 bool FbxConverter::save_animations() {
   BlockHeader header;
   header.id = BlockId::kAnimation;
-  ScopedBlock scoped_block(header, _writer);
+  ScopedBlock scoped_block(header, *_writer);
 
   prune_animations(&_animation_float);
   prune_animations(&_animation_vec3);
@@ -1382,23 +926,23 @@ bool FbxConverter::save_cameras() {
 
   BlockHeader header;
   header.id = BlockId::kCameras;
-  ScopedBlock scoped_block(header, _writer);
+  ScopedBlock scoped_block(header, *_writer);
 
   auto &cameras = _scene.cameras;
 
-  _writer.write((int)cameras.size());
+  _writer->write((int)cameras.size());
   for (size_t i = 0; i < cameras.size(); ++i) {
     auto camera = cameras[i];
-    _writer.add_deferred_string(camera->name);
-    write_vector(_writer, camera->pos);
-    write_vector(_writer, camera->target);
-    write_vector(_writer, camera->up);
-    _writer.write((float)camera->roll);
-    _writer.write((float)camera->aspect_ratio);
-    _writer.write((float)camera->fov_x);
-    _writer.write((float)camera->fov_y);
-    _writer.write((float)camera->near_plane);
-    _writer.write((float)camera->far_plane);
+    _writer->add_deferred_string(camera->name);
+    write_vector(*_writer, camera->pos);
+    write_vector(*_writer, camera->target);
+    write_vector(*_writer, camera->up);
+    _writer->write((float)camera->roll);
+    _writer->write((float)camera->aspect_ratio);
+    _writer->write((float)camera->fov_x);
+    _writer->write((float)camera->fov_y);
+    _writer->write((float)camera->near_plane);
+    _writer->write((float)camera->far_plane);
   };
 
   return true;
@@ -1408,17 +952,20 @@ bool FbxConverter::save_lights() {
 
   BlockHeader header;
   header.id = BlockId::kLights;
-  ScopedBlock scoped_block(header, _writer);
+  ScopedBlock scoped_block(header, *_writer);
 
   auto &lights = _scene.lights;
 
-  _writer.write((int)lights.size());
+  _writer->write((int)lights.size());
   for (size_t i = 0; i < lights.size(); ++i) {
     auto light = lights[i];
-    _writer.add_deferred_string(light->name);
-    write_vector(_writer, light->pos);
-    write_vector(_writer, light->color);
-    _writer.write((float)light->intensity);
+    _writer->add_deferred_string(light->name);
+    write_vector(*_writer, light->pos);
+    write_vector(*_writer, light->color);
+    _writer->write((float)light->intensity);
+    _writer->write(light->use_far_attenuation);
+    _writer->write((float)light->far_attenuation_start);
+    _writer->write((float)light->far_attenuation_end);
   }
 
   return true;
@@ -1428,39 +975,50 @@ bool FbxConverter::save_meshes() {
 
   BlockHeader header;
   header.id = BlockId::kMeshes;
-  ScopedBlock scoped_block(header, _writer);
+  ScopedBlock scoped_block(header, *_writer);
 
   auto &meshes = _scene.meshes;
 
-  _writer.write((int)meshes.size());
+  _writer->write((int)meshes.size());
   for (size_t i = 0; i < meshes.size(); ++i) {
 
     auto &mesh = meshes[i];
-    _writer.add_deferred_string(mesh->name);
-    _writer.write(mesh->obj_to_world);
+    _writer->add_deferred_string(mesh->name);
+    _writer->write(mesh->obj_to_world);
 
     // we save the vertex data in a deferred segment, because
     // once the buffers have been created we're free to throw
     // the data away
-    _writer.write((int)mesh->sub_meshes.size());
+    _writer->write((int)mesh->sub_meshes.size());
     for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
-      SubMesh *sub = mesh->sub_meshes[j];
-      _writer.add_deferred_string(sub->name);
-      _writer.add_deferred_string(sub->material);
+      SubMesh *sub = mesh->sub_meshes[j].get();
+      _writer->add_deferred_string(sub->name);
+      _writer->add_deferred_string(sub->material);
 
       void *vb, *ib;
       int vb_len, ib_len, index_size;
       compact_vertex_data(*sub, &vb, &vb_len);
       compact_index_data(*sub, &ib, &ib_len, &index_size);
 
-      _writer.write(sub->vertex_flags);
-      _writer.write(sub->element_size);
-      _writer.write(index_size);
-      _writer.add_deferred_binary(vb, vb_len);
-      _writer.add_deferred_binary(ib, ib_len);
+      _writer->write(sub->vertex_flags);
+      _writer->write(sub->element_size);
+      _writer->write(index_size);
+      _writer->add_deferred_binary(vb, vb_len);
+      _writer->add_deferred_binary(ib, ib_len);
     }
   }
 
+  return true;
+}
+
+bool FbxConverter::save_globals() {
+  BlockHeader header;
+  header.id = BlockId::kGlobals;
+  ScopedBlock scoped_block(header, *_writer);
+  _writer->write((float)_scene.ambient.mRed);
+  _writer->write((float)_scene.ambient.mGreen);
+  _writer->write((float)_scene.ambient.mBlue);
+  _writer->write((float)_scene.ambient.mAlpha);
   return true;
 }
 
@@ -1468,36 +1026,36 @@ bool FbxConverter::save_materials() {
 
   BlockHeader header;
   header.id = BlockId::kMaterials;
-  ScopedBlock scoped_block(header, _writer);
+  ScopedBlock scoped_block(header, *_writer);
 
   auto &materials = _scene.materials;
 
-  _writer.write((int)_scene.materials_by_name.size());
+  _writer->write((int)_scene.materials_by_name.size());
   for (auto it = begin(_scene.materials_by_name); it != end(_scene.materials_by_name); ++it) {
     const Material *mat = it->second;
-    _writer.add_deferred_string(mat->name);
-    _writer.add_deferred_string(mat->technique);
-    _writer.write((int)mat->properties.size());
+    _writer->add_deferred_string(mat->name);
+    _writer->add_deferred_string(mat->technique);
+    _writer->write((int)mat->properties.size());
 
     // write the properties for the material
     for (size_t i = 0; i < mat->properties.size(); ++i) {
       const MaterialProperty &prop = mat->properties[i];
-      _writer.add_deferred_string(prop.name);
-      _writer.add_deferred_string(prop.filename);
-      _writer.write(prop.type);
+      _writer->add_deferred_string(prop.name);
+      _writer->add_deferred_string(prop.filename);
+      _writer->write(prop.type);
       switch (prop.type) {
         case Property::kInt:
-          _writer.write(prop._int);
+          _writer->write(prop._int);
           break;
         case Property::kFloat:
-          _writer.write_raw(&prop._float[0], sizeof(float));
+          _writer->write_raw(&prop._float[0], sizeof(float));
           break;
         case Property::kFloat3:
-          _writer.write_raw(&prop._float[0], 3 * sizeof(float));
+          _writer->write_raw(&prop._float[0], 3 * sizeof(float));
           break;
         case Property::kFloat4:
         case Property::kColor:
-          _writer.write_raw(&prop._float[0], 4 * sizeof(float));
+          _writer->write_raw(&prop._float[0], 4 * sizeof(float));
           break;
         default:
           add_error("Unknown property type exporting materials");
