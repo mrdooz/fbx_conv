@@ -2,7 +2,6 @@
 
 #define FILE_VERSION 9
 
-
 #pragma pack(push, 1)
 struct MainHeader {
   int version;
@@ -81,10 +80,10 @@ struct Material {
 };
 
 struct SuperVertex {
-  SuperVertex(const FbxVector4 &pos, const FbxVector4 &normal) : pos(pos), normal(normal), idx(-1) {}
-  FbxVector4 pos;
-  FbxVector4 normal;
-  std::vector<FbxVector2> uv;
+  SuperVertex(const D3DXVECTOR3 &pos, const D3DXVECTOR3 &normal) : pos(pos), normal(normal), idx(-1) {}
+  D3DXVECTOR3 pos;
+  D3DXVECTOR3 normal;
+  std::vector<D3DXVECTOR2> uv;
   int idx;
 
   friend bool operator<(const SuperVertex &a, const SuperVertex &b) {
@@ -114,7 +113,7 @@ struct SuperVertex {
     return false;
   }
 };
-
+/*
 struct Vector2 {
   Vector2() {}
   Vector2(const FbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
@@ -126,7 +125,7 @@ struct Vector3 {
   Vector3(const FbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
   float x, y, z;
 };
-
+*/
 struct SubMesh {
 
   enum VertexFlags {
@@ -139,19 +138,19 @@ struct SubMesh {
   SubMesh(const std::string &name, const std::string &material, uint32 vertex_flags) 
     : name(name), material(material), vertex_flags(vertex_flags)
   {
-    element_size = vertex_flags & kPos ? sizeof(Vector3) : 0;
-    element_size += vertex_flags & kNormal ? sizeof(Vector3) : 0;
-    element_size += vertex_flags & kTex0 ? sizeof(Vector2) : 0;
-    element_size += vertex_flags & kTex1 ? sizeof(Vector2) : 0;
+    element_size = vertex_flags & kPos ? sizeof(D3DXVECTOR3) : 0;
+    element_size += vertex_flags & kNormal ? sizeof(D3DXVECTOR3) : 0;
+    element_size += vertex_flags & kTex0 ? sizeof(D3DXVECTOR2) : 0;
+    element_size += vertex_flags & kTex1 ? sizeof(D3DXVECTOR2) : 0;
   }
   std::string name;
   std::string material;
   uint32 vertex_flags;
   uint32 element_size;
-  std::vector<Vector3> pos;
-  std::vector<Vector3> normal;
-  std::vector<Vector2> tex0;
-  std::vector<Vector2> tex1;
+  std::vector<D3DXVECTOR3> pos;
+  std::vector<D3DXVECTOR3> normal;
+  std::vector<D3DXVECTOR2> tex0;
+  std::vector<D3DXVECTOR2> tex1;
   std::vector<uint32> indices;
 };
 
@@ -165,7 +164,7 @@ struct Mesh {
 
 struct Camera {
   std::string name;
-  FbxDouble3 pos, target, up;
+  D3DXVECTOR3 pos, target, up;
   FbxDouble roll;
   FbxDouble aspect_ratio;
   FbxDouble fov_x;
@@ -199,7 +198,7 @@ struct Light {
   FbxDouble far_attenuation_start;
   FbxDouble far_attenuation_end;
 
-  FbxDouble3 pos;
+  D3DXVECTOR3 pos;
   FbxDouble3 color;
   FbxDouble intensity;
 };

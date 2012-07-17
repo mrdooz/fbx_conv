@@ -3,14 +3,12 @@
 #include "stdafx.h"
 #include "fbx_conv.hpp"
 #include "utils.hpp"
-
+#include <functional>
 
 using namespace std;
 using namespace stdext;
 
 class FbxConverter;
-
-#define USE_DIRECTX_SYSTEM 0
 
 bool g_verbose;
 bool g_file_watch;
@@ -33,36 +31,30 @@ const int FILE_CHANGED_TIMER_ID = 1;
 
 #pragma comment(lib, "d3dx10.lib")
 
-
-
-#if USE_DIRECTX_SYSTEM
-FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
-  return FbxDouble4(m[0], m[1], m[2], (neg_w ? -1 : 1) * m[3]);
+template <class T, class U>
+U drop(const T &t) {
+  return U(t[0], t[1], t[2]);
 }
 
-FbxDouble3 max_to_dx(const FbxDouble3 &m) {
-  return m;
-}
-#else
-FbxDouble4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
-  return FbxDouble4(m[0], m[2], m[1], (neg_w ? -1 : 1) * m[3]);
-}
 
+D3DXVECTOR4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
+  return D3DXVECTOR4((float)m[0], (float)m[2], (float)m[1], (neg_w ? -1 : 1) * (float)m[3]);
+}
+/*
 FbxDouble3 max_to_dx(const FbxDouble3 &m) {
   return FbxDouble3(m[0], m[2], m[1]);
 }
-
-D3DXVECTOR3 max_to_dx2(const FbxDouble3 &m) {
+*/
+D3DXVECTOR3 max_to_dx(const FbxDouble3 &m) {
   return D3DXVECTOR3((float)m[0], (float)m[2], (float)m[1]);
 }
 
-#endif
 D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
   D3DXMATRIX mtx_s, mtx_r, mtx_t;
 
-  FbxDouble4 s = max_to_dx(mtx.GetS());
-  FbxDouble4 q = max_to_dx(mtx.GetQ(), true);
-  FbxDouble4 t = max_to_dx(mtx.GetT());
+  auto s = max_to_dx(mtx.GetS());
+  auto q = max_to_dx(mtx.GetQ(), true);
+  auto t = max_to_dx(mtx.GetT());
 
   return 
     *D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
@@ -76,13 +68,13 @@ void compact_vertex_data(const SubMesh &submesh, void **data, int *len) {
   char *buf = new char[*len];
   *data = buf;
   for (size_t i = 0; i < submesh.pos.size(); ++i) {
-    *(Vector3 *)buf = submesh.pos[i]; buf += sizeof(submesh.pos[0]);
-    *(Vector3 *)buf = submesh.normal[i]; buf += sizeof(submesh.normal[0]);
+    *(D3DXVECTOR3 *)buf = submesh.pos[i]; buf += sizeof(submesh.pos[0]);
+    *(D3DXVECTOR3 *)buf = submesh.normal[i]; buf += sizeof(submesh.normal[0]);
     if (submesh.vertex_flags & SubMesh::kTex0) {
-      *(Vector2 *)buf = submesh.tex0[i]; buf += sizeof(submesh.tex0[0]);
+      *(D3DXVECTOR2 *)buf = submesh.tex0[i]; buf += sizeof(submesh.tex0[0]);
     }
     if (submesh.vertex_flags & SubMesh::kTex1) {
-      *(Vector2 *)buf = submesh.tex1[i]; buf += sizeof(submesh.tex1[0]);
+      *(D3DXVECTOR2 *)buf = submesh.tex1[i]; buf += sizeof(submesh.tex1[0]);
     }
   }
 }
@@ -395,7 +387,7 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   return true;
 }
 
-FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *pPropertyName, const char *pFactorPropertyName, string *filename)
+static FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *pPropertyName, const char *pFactorPropertyName, string *filename)
 {
   FbxDouble3 lResult(0, 0, 0);
   const FbxProperty lProperty = pMaterial->FindProperty(pPropertyName);
@@ -410,7 +402,8 @@ FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *
     }
   }
 
-  if (lProperty.IsValid()) {
+  // get the filename
+  if (filename && lProperty.IsValid()) {
     if (int lTextureCount = lProperty.GetSrcObjectCount(FbxFileTexture::ClassId)) {
       if (const FbxFileTexture* lTexture = lProperty.GetSrcObject(FBX_TYPE(FbxFileTexture), 0)) {
         *filename = lTexture->GetFileName();
@@ -500,7 +493,19 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
       if (is_phong) {
         FbxSurfacePhong *mat = (FbxSurfacePhong *)node_material;
         ADD_PROP(Specular, mat);
-        ADD_PROP_FLOAT(Shininess, mat);
+        // grab the shininess, and convert it back to the 3dsmax value
+        // (parameters obtained via logarithmic regression)
+        double a0 = 0.0048;
+        double a1 = 14.42737962;
+        const FbxProperty shininess_property = mat->FindProperty(FbxSurfaceMaterial::sShininess);
+        if (shininess_property.IsValid()) {
+          double x = shininess_property.Get<FbxDouble>();
+          double shininess = a0 + a1 * log(x);
+          MaterialProperty prop("Shininess", shininess);
+          material->properties.emplace_back(prop);
+          //ADD_PROP_FLOAT(Shininess, mat);
+        }
+
         ADD_PROP(Reflection, mat);
       }
     } else {
@@ -617,6 +622,33 @@ FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex)
   return lPoseMatrix;
 }
 
+template <class T>
+vector<int> remove_keyframes(const vector<T> &org, const function<float(const T& a, const T& b)> &distance) {
+
+  auto tmp(org);
+
+  // calc diff between adjacent keyframes
+  vector<float> diff;
+  set<int> to_remove;
+  diff.resize(tmp.size()-2);
+  for (size_t i = 1; i < tmp.size()-1; ++i) {
+    float d = distance(tmp[i-1], tmp[i+1]);
+    diff[i-1] = d;
+    if (d < 0.00001f)
+      to_remove.insert(i);
+  }
+
+  vector<int> res;
+  res.reserve(org.size());
+
+  for (size_t i = 0; i < org.size(); ++i) {
+    if (to_remove.find(i) == to_remove.end())
+      res.push_back(i);
+  }
+
+  return res;
+}
+
 bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   INFO_SCOPE;
 
@@ -625,6 +657,10 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   vector<KeyFrameMtx> &mtx_anims = _animation_mtx[node->GetName()];
   vector<KeyFrameVec3> &vec3_anims = _animation_vec3[node->GetName()];
 
+  vector<D3DXVECTOR3> pos;
+  vector<D3DXQUATERNION> rot;
+  vector<D3DXVECTOR3> scale;
+
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
   for (int i = 0; i <= num_frames; ++i) {
     FbxTime cur;
@@ -632,13 +668,32 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
     cur.SetSecondDouble(cur_time);
     FbxAMatrix m;
     m = GetGlobalPosition(node, cur) * a;
+
+    //pos.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT())));
+    //rot.emplace_back(max_to_dx(m.GetQ(), true));
+    //scale.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS())));
+
+/*
+    auto mtx = max_to_dx(m);
+    D3DXVECTOR3 vZero(0,0,0);
+    D3DXQUATERNION qId(0,0,0,1);
+    D3DXQUATERNION qRot(r[0], r[1], r[2], r[3]);
+    D3DXMATRIX mtx2;
+    D3DXMatrixTransformation(&mtx2, &vZero, &qId, &s, &vZero, &qRot, &p);
+*/
     if (translation_only) {
-      vec3_anims.push_back(KeyFrameVec3(cur_time, max_to_dx2(m.GetT())));
+      auto t = m.GetT();
+      vec3_anims.push_back(KeyFrameVec3(cur_time, max_to_dx(FbxDouble3(t[0], t[1], t[2]))));
     } else {
       mtx_anims.push_back(KeyFrameMtx(cur_time, max_to_dx(m)));
     }
   }
-
+/*
+  auto pp = remove_keyframes<D3DXVECTOR3>(pos, 
+    [&](const D3DXVECTOR3 &a, const D3DXVECTOR3 &b) -> float { 
+      D3DXVECTOR3 d; D3DXVec3Subtract(&d, &a, &b); return D3DXVec3Length(&d); 
+  });
+*/
   return true;
 }
 
@@ -730,24 +785,21 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       const int poly_idx = indices[j];
       CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
-      FbxVector4 pos, normal;
-#if USE_DIRECTX_SYSTEM
-      for (int k = 0; k <= 2; ++k) {
-#else
+      //FbxVector4 pos, normal;
       // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
-#endif
-        pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
-        fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal);
-        normal = max_to_dx(normal);
+        auto pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
+        FbxVector4 normal2;
+        fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal2);
+        auto normal = max_to_dx(normal2);
 
-        SuperVertex cand(pos, normal);
+        SuperVertex cand(drop<D3DXVECTOR4, D3DXVECTOR3>(pos), drop<D3DXVECTOR4, D3DXVECTOR3>(normal));
         for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
           FbxVector2 uv;
           fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
           // flip the y-coordinate to match DirectX
           uv[1] = 1 - uv[1];
-          cand.uv.push_back(uv);
+          cand.uv.push_back(D3DXVECTOR2((float)uv[0], (float)uv[1]));
         }
 
         // create a supervertex for the current vertex, and check if it already exists to
@@ -756,8 +808,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         set<SuperVertex>::iterator it = super_verts.find(cand);
         if (it == super_verts.end()) {
           idx = cand.idx = sub_mesh->pos.size();
-          sub_mesh->pos.push_back(pos);
-          sub_mesh->normal.push_back(normal);
+          sub_mesh->pos.push_back(drop<D3DXVECTOR4, D3DXVECTOR3>(pos));
+          sub_mesh->normal.push_back(drop<D3DXVECTOR4, D3DXVECTOR3>(normal));
           if (vertex_flags & SubMesh::kTex0) sub_mesh->tex0.push_back(cand.uv[0]);
           if (vertex_flags & SubMesh::kTex1) sub_mesh->tex1.push_back(cand.uv[1]);
           super_verts.insert(cand);
@@ -869,6 +921,12 @@ bool FbxConverter::save_scene(const char *dst) {
   return true;
 }
 
+void write_vector(const Writer &writer, const D3DXVECTOR3 &v) {
+  writer.write(v[0]);
+  writer.write(v[1]);
+  writer.write(v[2]);
+}
+
 void write_vector(const Writer &writer, const FbxDouble3 &v) {
   writer.write((float)v[0]);
   writer.write((float)v[1]);
@@ -881,7 +939,8 @@ void write_vector(const Writer &writer, const FbxDouble4 &v) {
   writer.write((float)v[2]);
 }
 
-template<class T> void prune_animations(map<string, vector<KeyFrame<T>>> *anims) {
+template<class T> 
+void prune_animations(map<string, vector<KeyFrame<T>>> *anims) {
   for (auto it = begin(*anims); it != end(*anims); ) {
     if (it->second.empty()) {
       it = anims->erase(it);
@@ -891,7 +950,8 @@ template<class T> void prune_animations(map<string, vector<KeyFrame<T>>> *anims)
   }
 }
 
-template<class T> bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims) {
+template<class T> 
+bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims) {
 
   _writer->write((int)anims.size());
 
