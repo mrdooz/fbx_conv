@@ -1,6 +1,6 @@
 #pragma once
 
-#define FILE_VERSION 9
+#define FILE_VERSION 10
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -113,19 +113,7 @@ struct SuperVertex {
     return false;
   }
 };
-/*
-struct Vector2 {
-  Vector2() {}
-  Vector2(const FbxVector2 &v) : x((float)v[0]), y((float)v[1]) {}
-  float x, y;
-};
 
-struct Vector3 {
-  Vector3() {}
-  Vector3(const FbxVector4 &v) : x((float)v[0]), y((float)v[1]), z((float)v[2]) {}
-  float x, y, z;
-};
-*/
 struct SubMesh {
 
   enum VertexFlags {
@@ -215,9 +203,11 @@ struct KeyFrame {
   T value;
 };
 
-typedef KeyFrame<float> KeyFrameFloat;
+//typedef KeyFrame<float> KeyFrameFloat;
 typedef KeyFrame<D3DXVECTOR3> KeyFrameVec3;
-typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
+//typedef KeyFrame<D3DXQUATERNION> KeyFrameQuat;
+typedef KeyFrame<D3DXVECTOR4> KeyFrameVec4;
+//typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
 
 #pragma pack(pop)
 
@@ -265,6 +255,7 @@ private:
   bool save_cameras();
 
   template<class T> bool save_animations(const std::map<std::string, std::vector<KeyFrame<T>>> &anims);
+  template<class T> bool save_animations(const std::vector<KeyFrame<T>> &frames);
   bool save_animations();
   bool save_lights();
   bool save_materials();
@@ -292,9 +283,15 @@ private:
   char _indent_buffer[cMaxIndent+1];
 
   std::vector<std::string> _errors;
-  std::map<std::string, std::vector<KeyFrameFloat>> _animation_float;
-  std::map<std::string, std::vector<KeyFrameVec3>> _animation_vec3;
-  std::map<std::string, std::vector<KeyFrameMtx>> _animation_mtx;
+
+  struct Animation {
+    std::vector<KeyFrameVec3> pos;
+    std::vector<KeyFrameVec4> rot;
+    std::vector<KeyFrameVec3> scale;
+  };
+
+  std::map<std::string, Animation> _animation;
+  //std::map<std::string, std::vector<KeyFrameMtx>> _animation_mtx;
   Scene _scene;
   std::unique_ptr<Writer> _writer;
 

@@ -37,14 +37,14 @@ U drop(const T &t) {
 }
 
 
-D3DXVECTOR4 max_to_dx(const FbxDouble4 &m, bool neg_w = false) {
+D3DXVECTOR4 max_to_dx(const FbxDouble4 &m, bool neg_w) {
   return D3DXVECTOR4((float)m[0], (float)m[2], (float)m[1], (neg_w ? -1 : 1) * (float)m[3]);
 }
-/*
-FbxDouble3 max_to_dx(const FbxDouble3 &m) {
-  return FbxDouble3(m[0], m[2], m[1]);
+
+D3DXVECTOR4 max_to_dx(const FbxDouble4 &m) {
+  return D3DXVECTOR4((float)m[0], (float)m[2], (float)m[1], (float)m[3]);
 }
-*/
+
 D3DXVECTOR3 max_to_dx(const FbxDouble3 &m) {
   return D3DXVECTOR3((float)m[0], (float)m[2], (float)m[1]);
 }
@@ -646,6 +646,12 @@ vector<int> remove_keyframes(const vector<T> &org, const function<float(const T&
       res.push_back(i);
   }
 
+  // hack to simplify to 1 frame
+  if (res.size() == 2) {
+    if (org[res[0]] == org[res[1]])
+      res.pop_back();
+  }
+
   return res;
 }
 
@@ -654,11 +660,10 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
 
   FbxAMatrix a = GetGeometry(node);
 
-  vector<KeyFrameMtx> &mtx_anims = _animation_mtx[node->GetName()];
-  vector<KeyFrameVec3> &vec3_anims = _animation_vec3[node->GetName()];
+  auto &anim = _animation[node->GetName()];
 
   vector<D3DXVECTOR3> pos;
-  vector<D3DXQUATERNION> rot;
+  vector<D3DXVECTOR4> rot;
   vector<D3DXVECTOR3> scale;
 
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
@@ -668,32 +673,49 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
     cur.SetSecondDouble(cur_time);
     FbxAMatrix m;
     m = GetGlobalPosition(node, cur) * a;
+    pos.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT())));
+    rot.emplace_back(max_to_dx(m.GetQ(), true));
+    scale.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS())));
+  }
 
-    //pos.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT())));
-    //rot.emplace_back(max_to_dx(m.GetQ(), true));
-    //scale.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS())));
+  auto vec3_dist = [&](const D3DXVECTOR3 &a, const D3DXVECTOR3 &b) -> float { 
+    D3DXVECTOR3 d; D3DXVec3Subtract(&d, &a, &b); return D3DXVec3Length(&d);
+  };
 
-/*
-    auto mtx = max_to_dx(m);
-    D3DXVECTOR3 vZero(0,0,0);
-    D3DXQUATERNION qId(0,0,0,1);
-    D3DXQUATERNION qRot(r[0], r[1], r[2], r[3]);
-    D3DXMATRIX mtx2;
-    D3DXMatrixTransformation(&mtx2, &vZero, &qId, &s, &vZero, &qRot, &p);
-*/
-    if (translation_only) {
-      auto t = m.GetT();
-      vec3_anims.push_back(KeyFrameVec3(cur_time, max_to_dx(FbxDouble3(t[0], t[1], t[2]))));
-    } else {
-      mtx_anims.push_back(KeyFrameMtx(cur_time, max_to_dx(m)));
+  auto vec4_dist = [&](const D3DXVECTOR4 &a, const D3DXVECTOR4 &b) -> float { 
+    D3DXVECTOR4 d; D3DXVec4Subtract(&d, &a, &b); return D3DXVec4Length(&d);
+  };
+
+  // simplify the keyframes
+  auto pos_frames = remove_keyframes<D3DXVECTOR3>(pos, vec3_dist);
+  auto rot_frames = remove_keyframes<D3DXVECTOR4>(rot, vec4_dist);
+  auto scale_frames = remove_keyframes<D3DXVECTOR3>(scale, vec3_dist);
+
+  FbxTime cur;
+  FbxAMatrix m;
+  for (size_t i = 0; i < pos_frames.size(); ++i) {
+    double cur_time = pos_frames[i]*_duration/num_frames;
+    cur.SetSecondDouble(cur_time);
+    m = GetGlobalPosition(node, cur) * a;
+    anim.pos.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
+  }
+
+  if (!translation_only) {
+    for (size_t i = 0; i < rot_frames.size(); ++i) {
+      double cur_time = rot_frames[i]*_duration/num_frames;
+      cur.SetSecondDouble(cur_time);
+      m = GetGlobalPosition(node, cur) * a;
+      anim.rot.emplace_back(KeyFrameVec4(cur_time, max_to_dx(m.GetQ(), true)));
+    }
+
+    for (size_t i = 0; i < scale_frames.size(); ++i) {
+      double cur_time = scale_frames[i]*_duration/num_frames;
+      cur.SetSecondDouble(cur_time);
+      m = GetGlobalPosition(node, cur) * a;
+      anim.scale.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
     }
   }
-/*
-  auto pp = remove_keyframes<D3DXVECTOR3>(pos, 
-    [&](const D3DXVECTOR3 &a, const D3DXVECTOR3 &b) -> float { 
-      D3DXVECTOR3 d; D3DXVec3Subtract(&d, &a, &b); return D3DXVec3Length(&d); 
-  });
-*/
+
   return true;
 }
 
@@ -966,11 +988,33 @@ bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims
   return true;
 }
 
+template<class T> 
+bool FbxConverter::save_animations(const vector<KeyFrame<T>> &frames) {
+
+  _writer->write((int)frames.size());
+  if (frames.size() > 0)
+    _writer->write_raw(&frames[0], sizeof(frames[0]) * frames.size());
+
+  return true;
+}
+
 bool FbxConverter::save_animations() {
   BlockHeader header;
   header.id = BlockId::kAnimation;
   ScopedBlock scoped_block(header, *_writer);
 
+  for (auto it = begin(_animation); it != end(_animation); ++it) {
+    auto &name = it->first;
+    auto &anim = it->second;
+    if (!anim.pos.empty() || !anim.rot.empty() || !anim.scale.empty()) {
+      _writer->add_deferred_string(name);
+      save_animations<D3DXVECTOR3>(anim.pos);
+      save_animations<D3DXVECTOR4>(anim.rot);
+      save_animations<D3DXVECTOR3>(anim.scale);
+    }
+  }
+
+/*
   prune_animations(&_animation_float);
   prune_animations(&_animation_vec3);
   prune_animations(&_animation_mtx);
@@ -978,7 +1022,7 @@ bool FbxConverter::save_animations() {
   save_animations<float>(_animation_float);
   save_animations<D3DXVECTOR3>(_animation_vec3);
   save_animations<D3DXMATRIX>(_animation_mtx);
-
+*/
   return true;
 }
 
