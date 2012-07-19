@@ -203,11 +203,8 @@ struct KeyFrame {
   T value;
 };
 
-//typedef KeyFrame<float> KeyFrameFloat;
 typedef KeyFrame<D3DXVECTOR3> KeyFrameVec3;
-//typedef KeyFrame<D3DXQUATERNION> KeyFrameQuat;
 typedef KeyFrame<D3DXVECTOR4> KeyFrameVec4;
-//typedef KeyFrame<D3DXMATRIX> KeyFrameMtx;
 
 #pragma pack(pop)
 
@@ -235,8 +232,6 @@ public:
   ~FbxConverter();
   bool convert(const char *src, const char *dst);
 private:
-
-  bool convert_inner(const char *src, const char *dst);
 
   // like a CSI!
   bool process_scene(FbxScene *scene);
@@ -266,6 +261,7 @@ private:
 
   void add_error(const char *fmt, ...);
   void add_info(const char *fmt, ...);
+  void add_verbose(const char *fmt, ...);
 
   static const int cIndentLevel = 4;
   static const int cMaxIndent = 512;
@@ -291,7 +287,6 @@ private:
   };
 
   std::map<std::string, Animation> _animation;
-  //std::map<std::string, std::vector<KeyFrameMtx>> _animation_mtx;
   Scene _scene;
   std::unique_ptr<Writer> _writer;
 
@@ -308,6 +303,8 @@ private:
   FbxIOSettings *_settings;
   FbxGeometryConverter *_converter;
   FbxImporter *_importer;
+
+  FILE *_log_file;
 
   std::vector<MaterialInfo> _material_info;
   std::string _texture_dst;

@@ -4,6 +4,7 @@
 #include "fbx_conv.hpp"
 #include "utils.hpp"
 #include <functional>
+#include <mmsystem.h>
 
 using namespace std;
 using namespace stdext;
@@ -30,6 +31,7 @@ const int FILE_CHANGED_TIMER_ID = 1;
 #endif
 
 #pragma comment(lib, "d3dx10.lib")
+#pragma comment(lib, "winmm.lib")
 
 template <class T, class U>
 U drop(const T &t) {
@@ -104,6 +106,7 @@ FbxConverter::FbxConverter()
   , _indent_level(0)
   , _evaluator(nullptr)
   , _writer(new Writer)
+  , _log_file(nullptr)
 {
   memset(_indent_buffer, ' ', cMaxIndent);
   _indent_buffer[cMaxIndent] = '\0';
@@ -128,61 +131,85 @@ string to_string(const char *format, ...)
 
 #define CHECK_FATAL(x, msg, ...) if (!(x)) {_errors.push_back(string("!! ") + __FUNCTION__ + string(": ") + to_string(msg, __VA_ARGS__)); return false; }
 
-bool FbxConverter::convert_inner(const char *src, const char *dst) {
-
-  bool res = _importer->Initialize(src, -1, _settings);
-  if (!res) {
-    _errors.push_back(to_string("Error calling FbxImporter::Initialize: %s", _importer->GetLastErrorString()));
-    return false;
-  }
-
-  _fbx_scene = FbxScene::Create(_mgr, "my_scene");
-  _evaluator = _fbx_scene->GetEvaluator();
-  _importer->Import(_fbx_scene);
-  const FbxGlobalSettings &global_settings = _fbx_scene->GetGlobalSettings();
-  auto time_mode = global_settings.GetTimeMode();
-  FbxTimeSpan time_span;
-  global_settings.GetTimelineDefaultTimeSpan(time_span);
-  _start_time = time_span.GetStart();
-  _stop_time = time_span.GetStop();
-  _duration = time_span.GetDuration().GetSecondDouble();
-  _duration_ms = time_span.GetDuration().GetMilliSeconds();
-  _fps = time_span.GetDuration().GetFrameRate(time_mode);
-  _scene.ambient = global_settings.GetAmbientColor();
-
-  auto axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
-
-  // check if we need to convert the scene to a DirectX coordinate system
-#if USE_DIRECTX_SYSTEM
-  if (axis != FbxAxisSystem::eDirectX) {
-    FbxAxisSystem dx_system(FbxAxisSystem::eDirectX);
-    dx_system.ConvertScene(_fbx_scene);
-  }
-#else
-  // require a 3ds-max system
-  if (axis != FbxAxisSystem::eMax) {
-    add_error("We require a 3ds-max coordinate system");
-    return false;
-  }
-#endif
-
-  process_scene(_fbx_scene);
-  save_scene(dst);
-
-  _fbx_scene->Destroy();
-  _fbx_scene = NULL;
-
-  return true;
-}
-
 bool FbxConverter::convert(const char *src, const char *dst) {
 
-  add_info("===================================================================");
-  bool res = convert_inner(src, dst);
+  DWORD start_time = timeGetTime();
+  DWORD end_time;
 
-  for (auto it = begin(_errors); it != end(_errors); ++it) {
-    cout << *it << endl;
+  // tihi, my c++ looks like JS :)
+  bool res = [&]() -> bool {
+
+    DEFER([&] { end_time = timeGetTime(); } );
+    add_info("===================================================================");
+    _log_file = fopen((string(dst) + ".log").c_str(), "wt");
+    if (!_log_file) {
+      add_error("unable to open log file!");
+      return false;
+    }
+
+
+    bool res = _importer->Initialize(src, -1, _settings);
+    if (!res) {
+      add_error(to_string("Error calling FbxImporter::Initialize: %s", _importer->GetLastErrorString()).c_str());
+      return false;
+    }
+
+    _fbx_scene = FbxScene::Create(_mgr, "my_scene");
+    _evaluator = _fbx_scene->GetEvaluator();
+    _importer->Import(_fbx_scene);
+    const FbxGlobalSettings &global_settings = _fbx_scene->GetGlobalSettings();
+    auto time_mode = global_settings.GetTimeMode();
+    FbxTimeSpan time_span;
+    global_settings.GetTimelineDefaultTimeSpan(time_span);
+    _start_time = time_span.GetStart();
+    _stop_time = time_span.GetStop();
+    _duration = time_span.GetDuration().GetSecondDouble();
+    _duration_ms = time_span.GetDuration().GetMilliSeconds();
+    _fps = time_span.GetDuration().GetFrameRate(time_mode);
+    _scene.ambient = global_settings.GetAmbientColor();
+
+    auto axis = _fbx_scene->GetGlobalSettings().GetAxisSystem();
+
+    // check if we need to convert the scene to a DirectX coordinate system
+#if USE_DIRECTX_SYSTEM
+    if (axis != FbxAxisSystem::eDirectX) {
+      FbxAxisSystem dx_system(FbxAxisSystem::eDirectX);
+      dx_system.ConvertScene(_fbx_scene);
+    }
+#else
+    // require a 3ds-max system
+    if (axis != FbxAxisSystem::eMax) {
+      add_error("We require a 3ds-max coordinate system");
+      return false;
+    }
+#endif
+
+    process_scene(_fbx_scene);
+    save_scene(dst);
+
+    _fbx_scene->Destroy();
+    _fbx_scene = NULL;
+    return true;
+  }();
+
+  add_verbose("Elapsed time: %.2f", (end_time - start_time) / 1000.0f);
+
+  if (!_errors.empty()) {
+    if (_log_file) {
+      fprintf(_log_file, "****************** ERRORS ******************\n");
+      for (size_t i = 0; i < _errors.size(); ++i) {
+        fprintf(_log_file, "%s\n", _errors[i].c_str());
+      }
+    }
+    for (size_t i = 0; i < _errors.size(); ++i)
+      puts(_errors[i].c_str());
   }
+
+  if (_log_file) {
+    fclose(_log_file);
+    _log_file = nullptr;
+  }
+
 
   return res;
 }
@@ -213,9 +240,7 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *fbx_light) {
 
   _scene.lights.emplace_back(shared_ptr<Light>(light));
 
-  if (g_verbose) {
-    add_info("found light: %s", light->name.c_str());
-  }
+  add_verbose("found light: %s", light->name.c_str());
 
   if (!process_animation(node, true))
     return false;
@@ -368,9 +393,7 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
   _scene.cameras.emplace_back(shared_ptr<Camera>(c));
 
-  if (g_verbose) {
-    add_info("found camera: %s", c->name.c_str());
-  }
+  add_verbose("found camera: %s", c->name.c_str());
 
   if (!process_animation(node, true))
     return false;
@@ -448,9 +471,7 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
     if (_scene.materials_by_name.find(name) != _scene.materials_by_name.end())
       continue;
 
-    if (g_verbose) {
-      add_info("found material: %s", name);
-    }
+    add_verbose("found material: %s", name);
 
     Material *material = new Material(name);
     _scene.materials_by_name.insert(make_pair(name, material));
@@ -774,9 +795,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   shared_ptr<Mesh> mesh(new Mesh(fbx_node->GetName()));
   _scene.meshes.push_back(mesh);
 
-  if (g_verbose && polys_by_material.size() > 1) {
-    add_info("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
-  }
+  if (polys_by_material.size() > 1)
+    add_verbose("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
 
   mesh->obj_to_world = max_to_dx(fbx_node->EvaluateGlobalTransform());
 
@@ -807,7 +827,6 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       const int poly_idx = indices[j];
       CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
 
-      //FbxVector4 pos, normal;
       // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
         auto pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
@@ -939,6 +958,17 @@ bool FbxConverter::save_scene(const char *dst) {
   _writer->push_exch();
   _writer->write(header);
   _writer->pop_pos();
+
+  add_verbose("** INFO **");
+  add_verbose("Total size: %d", header.total_size);
+#define ADD_INFO(name, o1, o2) add_verbose(#name ## " size: %d (%.2f Mb)", header.o1 - header.o2, (header.o1 - header.o2) / (float)(1024 * 1024));
+  ADD_INFO(Material, mesh_ofs, material_ofs);
+  ADD_INFO(Mesh, light_ofs, mesh_ofs);
+  ADD_INFO(Light, camera_ofs, light_ofs);
+  ADD_INFO(Camera, animation_ofs, camera_ofs);
+  ADD_INFO(Animation, binary_ofs, animation_ofs);
+  ADD_INFO(Binary, total_size, binary_ofs);
+#undef ADD_INFO
 
   return true;
 }
@@ -1274,6 +1304,26 @@ void FbxConverter::add_info(const char *fmt, ...) {
   memset(buf, ' ', _indent_level);
   va_end(arg);
   puts(buf);
+
+  if (_log_file)
+    fprintf(_log_file, "%s\n", buf);
+}
+
+void FbxConverter::add_verbose(const char *fmt, ...) {
+
+  va_list arg;
+  va_start(arg, fmt);
+  int len = _vscprintf(fmt, arg);
+  char *buf = (char *)_alloca(len + 1 + _indent_level);
+  vsprintf_s(buf + _indent_level, len + 1, fmt, arg);
+  memset(buf, ' ', _indent_level);
+  va_end(arg);
+
+  if (g_verbose)
+    puts(buf);
+
+  if (_log_file)
+    fprintf(_log_file, "%s\n", buf);
 }
 
 string wide_char_to_utf8(LPCWSTR str, int len_in_bytes) {

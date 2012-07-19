@@ -2,9 +2,18 @@
 
 #define SAFE_DELETE(x) if( (x) != 0 ) { delete (x); (x) = 0; }
 
+struct ScopedObj
+{
+  typedef std::function<void()> Fn;
+  ScopedObj(const Fn& fn) : fn(fn) {}
+  ~ScopedObj() { fn(); }
+  Fn fn;
+};
+
 #define GEN_NAME2(prefix, line) prefix##line
 #define GEN_NAME(prefix, line) GEN_NAME2(prefix, line)
 #define MAKE_SCOPED(type) type GEN_NAME(ANON, __COUNTER__)
+#define DEFER(x) MAKE_SCOPED(ScopedObj)(x);
 
 #define RANGE(x) begin(x), end(x)
 
