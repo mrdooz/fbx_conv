@@ -1,5 +1,40 @@
 // converter between .fbx and .kumi format
 
+/*
+
+Original
+** INFO **
+Total size: 5048642
+Material size: 1188 (0.00 Mb)
+Mesh size: 33212 (0.03 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 3219762 (3.07 Mb)
+
+No unnecessary texture coordinates
+** INFO **
+Total size: 4736938
+Material size: 1188 (0.00 Mb)
+Mesh size: 33212 (0.03 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 2908058 (2.77 Mb)
+
+32-bit normals
+** INFO **
+Total size: 4025042
+Material size: 1188 (0.00 Mb)
+Mesh size: 33212 (0.03 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 2196162 (2.09 Mb)
+
+
+*/
+
 #include "stdafx.h"
 #include "fbx_conv.hpp"
 #include "utils.hpp"
@@ -63,39 +98,6 @@ D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
     *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
 }
-
-
-void compact_vertex_data(const SubMesh &submesh, void **data, int *len) {
-  *len = submesh.element_size * submesh.pos.size();
-  char *buf = new char[*len];
-  *data = buf;
-  for (size_t i = 0; i < submesh.pos.size(); ++i) {
-    *(D3DXVECTOR3 *)buf = submesh.pos[i]; buf += sizeof(submesh.pos[0]);
-    *(D3DXVECTOR3 *)buf = submesh.normal[i]; buf += sizeof(submesh.normal[0]);
-    if (submesh.vertex_flags & SubMesh::kTex0) {
-      *(D3DXVECTOR2 *)buf = submesh.tex0[i]; buf += sizeof(submesh.tex0[0]);
-    }
-    if (submesh.vertex_flags & SubMesh::kTex1) {
-      *(D3DXVECTOR2 *)buf = submesh.tex1[i]; buf += sizeof(submesh.tex1[0]);
-    }
-  }
-}
-
-void compact_index_data(const SubMesh &submesh, void **data, int *len, int *index_size) {
-  // check if we need 16 or 32 bit indices
-  const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
-  const size_t elems = submesh.indices.size();
-  const bool need_32_bit = num_verts >= (1 << 16);
-  *index_size = need_32_bit ? 4 : 2;
-  *len = elems * (*index_size);
-  void *buf = new char[*len];
-  *data = buf;
-  if (need_32_bit)
-    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
-  else
-    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
-}
-
 
 
 FbxConverter::FbxConverter() 
@@ -238,7 +240,7 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *fbx_light) {
   light->far_attenuation_start = fbx_light->FarAttenuationStart.Get();
   light->far_attenuation_end = fbx_light->FarAttenuationEnd.Get();
 
-  _scene.lights.emplace_back(shared_ptr<Light>(light));
+  _scene.lights.emplace_back(unique_ptr<Light>(light));
 
   add_verbose("found light: %s", light->name.c_str());
 
@@ -379,7 +381,7 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   double fov_x, fov_y, aspect;
   get_aspect_and_fov(camera, &fov_x, &fov_y, &aspect);
 
-  Camera *c = new Camera;
+  auto c = unique_ptr<Camera>(new Camera);
   c->name = node->GetName();
   c->pos = max_to_dx(camera->Position.Get());
   c->target = max_to_dx(camera->InterestPosition.Get());
@@ -390,8 +392,6 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   c->fov_y = (float)fov_y;
   c->near_plane = camera->NearPlane.Get();
   c->far_plane = camera->FarPlane.Get();
-
-  _scene.cameras.emplace_back(shared_ptr<Camera>(c));
 
   add_verbose("found camera: %s", c->name.c_str());
 
@@ -407,6 +407,7 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   if (!process_animation(target, true))
     return false;
 
+  _scene.cameras.push_back(move(c));
   return true;
 }
 
@@ -475,7 +476,7 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
 
     Material *material = new Material(name);
     _scene.materials_by_name.insert(make_pair(name, material));
-    _scene.materials.push_back(shared_ptr<Material>(material));
+    _scene.materials.push_back(unique_ptr<Material>(material));
 
 #define ADD_PROP(name, mat) { string filename; \
   MaterialProperty prop(#name, GetMaterialProperty(mat, FbxSurfaceMaterial::s##name, FbxSurfaceMaterial::s##name##Factor, &filename), true); \
@@ -756,13 +757,12 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   CHECK_FATAL(layer, "no layer 0 found");
 
   // group the polygons by material
-  typedef vector<int> PolyIndices;
-  vector<PolyIndices > polys_by_material;
-  for (int i = 0; i < material_count; ++i)
-    polys_by_material.push_back(vector<int>());
+  vector<vector<int>> polys_by_material;
+  polys_by_material.resize(max(1, material_count));
 
   bool use_default_material = false;
-  if (const FbxLayerElementMaterial *materials = layer->GetMaterials()) {
+  const FbxLayerElementMaterial *materials = layer->GetMaterials();
+  if (materials) {
     FbxLayerElement::EMappingMode mm = materials->GetMappingMode();
     static const char *mm_str[] = { "eNONE", "eBY_CONTROL_POINT", "eBY_POLYGON_VERTEX", "eBY_POLYGON", "eBY_EDGE", "eALL_SAME" };
     CHECK_FATAL(mm == FbxLayerElement::eByPolygon || mm == FbxLayerElement::eAllSame, 
@@ -782,7 +782,6 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   } else {
     // no materials found, so use default material
     use_default_material = true;
-    polys_by_material.push_back(PolyIndices());
     for (int i = 0; i < fbx_mesh->GetPolygonCount(); ++i)
       polys_by_material[0].push_back(i);
   }
@@ -792,19 +791,27 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   for (int i = 0; i < layer->GetUVSetCount(); ++i)
     uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
-  shared_ptr<Mesh> mesh(new Mesh(fbx_node->GetName()));
-  _scene.meshes.push_back(mesh);
+  auto mesh = unique_ptr<Mesh>(new Mesh(fbx_node->GetName()));
 
   if (polys_by_material.size() > 1)
     add_verbose("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
 
   mesh->obj_to_world = max_to_dx(fbx_node->EvaluateGlobalTransform());
 
-  uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
-  vertex_flags |= uv_sets.size() == 2 ? SubMesh::kTex1 | SubMesh::kTex0 : uv_sets.size() == 1 ? SubMesh::kTex0 : 0;
-
   // each material used for the mesh creates a sub mesh
   for (size_t i = 0; i < polys_by_material.size(); ++i) {
+
+    uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
+
+    if (!use_default_material) {
+      // check if the current material uses a diffuse map
+      FbxSurfaceMaterial *material = fbx_node->GetMaterial(i);
+      const char *name = material->GetName();
+      string filename;
+      GetMaterialProperty(material, FbxSurfaceMaterial::sDiffuse, FbxSurfaceMaterial::sDiffuseFactor, &filename);
+      if (!filename.empty())
+        vertex_flags |= SubMesh::kTex0;
+    }
 
     // keep track of the unique vertices
     set<SuperVertex> super_verts;
@@ -822,7 +829,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       _material_info.push_back(info);
     }
 
-    const PolyIndices &indices = polys_by_material[i];
+    auto &indices = polys_by_material[i];
     for (size_t j = 0; j < indices.size(); ++j) {
       const int poly_idx = indices[j];
       CHECK_FATAL(fbx_mesh->GetPolygonSize(j) == 3, "Only polygons of size 3 supported");
@@ -862,6 +869,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       }
     }
   }
+
+  _scene.meshes.push_back(move(mesh));
 
   if (!process_animation(fbx_node, false))
     return false;
@@ -1066,7 +1075,7 @@ bool FbxConverter::save_cameras() {
 
   _writer->write((int)cameras.size());
   for (size_t i = 0; i < cameras.size(); ++i) {
-    auto camera = cameras[i];
+    auto &camera = cameras[i];
     _writer->add_deferred_string(camera->name);
     write_vector(*_writer, camera->pos);
     write_vector(*_writer, camera->target);
@@ -1092,7 +1101,7 @@ bool FbxConverter::save_lights() {
 
   _writer->write((int)lights.size());
   for (size_t i = 0; i < lights.size(); ++i) {
-    auto light = lights[i];
+    auto &light = lights[i];
     _writer->add_deferred_string(light->name);
     write_vector(*_writer, light->pos);
     write_vector(*_writer, light->color);
@@ -1120,25 +1129,22 @@ bool FbxConverter::save_meshes() {
     _writer->add_deferred_string(mesh->name);
     _writer->write(mesh->obj_to_world);
 
-    // we save the vertex data in a deferred segment, because
-    // once the buffers have been created we're free to throw
-    // the data away
     _writer->write((int)mesh->sub_meshes.size());
     for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
       SubMesh *sub = mesh->sub_meshes[j].get();
       _writer->add_deferred_string(sub->name);
       _writer->add_deferred_string(sub->material);
 
-      void *vb, *ib;
-      int vb_len, ib_len, index_size;
-      compact_vertex_data(*sub, &vb, &vb_len);
-      compact_index_data(*sub, &ib, &ib_len, &index_size);
+      int index_size;
+      vector<char> vb, ib;
+      compact_vertex_data(*sub, &vb);
+      compact_index_data(*sub, &ib, &index_size);
 
       _writer->write(sub->vertex_flags);
       _writer->write(sub->element_size);
       _writer->write(index_size);
-      _writer->add_deferred_binary(vb, vb_len);
-      _writer->add_deferred_binary(ib, ib_len);
+      _writer->add_deferred_binary(vb.data(), vb.size());
+      _writer->add_deferred_binary(ib.data(), ib.size());
     }
   }
 
@@ -1239,7 +1245,7 @@ bool FbxConverter::save_material_info() {
   auto &materials = _scene.materials;
   size_t num_mats = materials.size();
   for (size_t i = 0; i < num_mats; ++i) {
-    auto mat = materials[i];
+    auto &mat = materials[i];
     size_t num_props = mat->properties.size();
     fprintf(f, "\t\t{\n\t\t\t\"name\" : \"%s\"%s\n", mat->name.c_str(), num_props ? ", " : "");
 
@@ -1532,3 +1538,71 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   return msg.wParam;
 }
 
+void FbxConverter::compact_vertex_data(const SubMesh &submesh, vector<char> *data) {
+  int len = submesh.element_size * submesh.pos.size();
+  data->resize(len);
+  char *buf = data->data();
+
+  //add_verbose("*** COMPACT ***");
+
+#define SET_INC(type, src) { *(type *)buf = src; buf += sizeof(type); }
+  for (size_t i = 0; i < submesh.pos.size(); ++i) {
+    SET_INC(D3DXVECTOR3, submesh.pos[i]);
+    // save normal as 1+14 bit x, 1+15 bit y, and 1 sign bit for z
+    D3DXVECTOR3 n = submesh.normal[i];
+    D3DXVec3Normalize(&n, &n);
+    int neg_x = n.x < 0 ? 1 : 0;
+    int neg_y = n.y < 0 ? 1 : 0;
+    int neg_z = n.z < 0 ? 1 : 0;
+    int nx = (int)fabs(16383 * n.x);
+    int ny = (int)fabs(32767 * n.y);
+    uint32 normal = 
+      (neg_x << 31) | (nx << 17) |
+      (neg_y << 16) | (ny <<  1) |
+      (neg_z);
+    SET_INC(uint32, normal);
+/*
+    {
+      D3DXVECTOR3 n2;
+      bool neg_x = !!(normal & (1 << 31));
+      bool neg_y = !!(normal & (1 << 16));
+      bool neg_z = !!(normal & 1);
+
+      n2.x = (neg_x ? -1 : 1) * (((normal >> 17) & 0x3fff) / 16383.0f);
+      n2.y = (neg_y ? -1 : 1) * (((normal >>  1) & 0x7fff) / 32767.0f);
+      n2.z = (neg_z ? -1 : 1) * (sqrtf(1 - n2.x * n2.x - n2.y * n2.y));
+      D3DXVec3Normalize(&n2, &n2);
+
+      D3DXVECTOR3 d;
+      D3DXVec3Subtract(&d, &n, &n2);
+      if (D3DXVec3Length(&d) > 0.1f) {
+        int a = 10;
+      }
+    }
+*/
+    //add_verbose("%.8x, %f, %f, %f", normal, n.x, n.y, n.z);
+
+    if (submesh.vertex_flags & SubMesh::kTex0) {
+      SET_INC(D3DXVECTOR2, submesh.tex0[i]);
+    }
+    if (submesh.vertex_flags & SubMesh::kTex1) {
+      SET_INC(D3DXVECTOR2, submesh.tex1[i]);
+    }
+  }
+  data->resize(buf - data->data());
+}
+
+void FbxConverter::compact_index_data(const SubMesh &submesh, vector<char> *data, int *index_size) {
+  // check if we need 16 or 32 bit indices
+  const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
+  const size_t elems = submesh.indices.size();
+  const bool need_32_bit = num_verts >= (1 << 16);
+  *index_size = need_32_bit ? 4 : 2;
+  int len = elems * (*index_size);
+  data->resize(len);
+  char *buf = data->data();
+  if (need_32_bit)
+    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
+  else
+    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
+}

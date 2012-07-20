@@ -1,6 +1,6 @@
 #pragma once
 
-#define FILE_VERSION 10
+#define FILE_VERSION 11
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -210,11 +210,11 @@ typedef KeyFrame<D3DXVECTOR4> KeyFrameVec4;
 
 struct Scene {
   FbxColor ambient;
-  std::vector<std::shared_ptr<Camera>> cameras;
-  std::vector<std::shared_ptr<Light>> lights;
+  std::vector<std::unique_ptr<Camera>> cameras;
+  std::vector<std::unique_ptr<Light>> lights;
   std::map<std::string, Material *> materials_by_name;
-  std::vector<std::shared_ptr<Material>> materials;
-  std::vector<std::shared_ptr<Mesh>> meshes;
+  std::vector<std::unique_ptr<Material>> materials;
+  std::vector<std::unique_ptr<Mesh>> meshes;
 };
 
 struct MaterialInfo {
@@ -258,6 +258,9 @@ private:
   bool save_material_info();
 
   void copy_texture(std::string src, std::string *dst);
+
+  void compact_vertex_data(const SubMesh &submesh, std::vector<char> *data);
+  void compact_index_data(const SubMesh &submesh, std::vector<char> *data, int *index_size);
 
   void add_error(const char *fmt, ...);
   void add_info(const char *fmt, ...);
