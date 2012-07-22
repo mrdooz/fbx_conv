@@ -1,6 +1,6 @@
 #pragma once
 
-#define FILE_VERSION 11
+#define FILE_VERSION 12
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -114,6 +114,7 @@ struct SuperVertex {
   }
 };
 
+struct Mesh;
 struct SubMesh {
 
   enum VertexFlags {
@@ -123,14 +124,15 @@ struct SubMesh {
     kTex1    = 1 << 3,
   };
 
-  SubMesh(const std::string &name, const std::string &material, uint32 vertex_flags) 
-    : name(name), material(material), vertex_flags(vertex_flags)
+  SubMesh(Mesh *mesh, const std::string &name, const std::string &material, uint32 vertex_flags) 
+    : mesh(mesh), name(name), material(material), vertex_flags(vertex_flags)
   {
     element_size = vertex_flags & kPos ? sizeof(D3DXVECTOR3) : 0;
     element_size += vertex_flags & kNormal ? sizeof(D3DXVECTOR3) : 0;
     element_size += vertex_flags & kTex0 ? sizeof(D3DXVECTOR2) : 0;
     element_size += vertex_flags & kTex1 ? sizeof(D3DXVECTOR2) : 0;
   }
+  Mesh *mesh;
   std::string name;
   std::string material;
   uint32 vertex_flags;
@@ -146,6 +148,8 @@ struct Mesh {
   Mesh(const std::string &name) : name(name) {}
   std::string name;
   D3DXMATRIX obj_to_world;
+  D3DXVECTOR3 center;
+  D3DXVECTOR3 extents;
   std::vector<std::unique_ptr<SubMesh>> sub_meshes;
 };
 
@@ -280,6 +284,34 @@ private:
 
   int _indent_level;
   char _indent_buffer[cMaxIndent+1];
+
+  struct Stats {
+    void reset() {
+      num_verts = 0;
+      num_indices = 0;
+      vert_data_size = 0;
+      index_data_size = 0;
+      index_slack = 0;
+    }
+
+    void print() {
+      _conv->add_verbose("Num verts: %d", num_verts);
+      _conv->add_verbose("Num indices: %d", num_indices);
+      _conv->add_verbose("Vertex data size: %d", vert_data_size);
+      _conv->add_verbose("Index data size: %d", index_data_size);
+      _conv->add_verbose("Index slack: %d", index_slack);
+    }
+
+    Stats(FbxConverter *conv) : _conv(conv) { reset(); }
+    int num_verts;
+    int num_indices;
+    int vert_data_size;
+    int index_data_size;
+    int index_slack;
+    FbxConverter *_conv;
+  };
+
+  Stats _stats;
 
   std::vector<std::string> _errors;
 

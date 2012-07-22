@@ -31,6 +31,26 @@ Light size: 176 (0.00 Mb)
 Camera size: 76 (0.00 Mb)
 Animation size: 1794168 (1.71 Mb)
 Binary size: 2196162 (2.09 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 1423984
+Index data size: 748416
+Index slack: 28067
+
+16-bit pos
+** INFO **
+Total size: 3499088
+Material size: 1188 (0.00 Mb)
+Mesh size: 41180 (0.04 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 1662240 (1.59 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 890062
+Index data size: 748416
+Index slack: 28067
 
 
 */
@@ -47,6 +67,7 @@ using namespace stdext;
 class FbxConverter;
 
 bool g_verbose;
+bool g_export_animation = true;
 bool g_file_watch;
 FbxConverter *g_converter;
 string g_src_path;
@@ -71,6 +92,13 @@ const int FILE_CHANGED_TIMER_ID = 1;
 template <class T, class U>
 U drop(const T &t) {
   return U(t[0], t[1], t[2]);
+}
+
+static int num_bits(int a) {
+  int res = 1;
+  while (a > (1 << res) - 1)
+    ++res;
+  return res;
 }
 
 
@@ -109,6 +137,8 @@ FbxConverter::FbxConverter()
   , _evaluator(nullptr)
   , _writer(new Writer)
   , _log_file(nullptr)
+#pragma warning(suppress: 4355)
+  , _stats(this)
 {
   memset(_indent_buffer, ' ', cMaxIndent);
   _indent_buffer[cMaxIndent] = '\0';
@@ -137,6 +167,7 @@ bool FbxConverter::convert(const char *src, const char *dst) {
 
   DWORD start_time = timeGetTime();
   DWORD end_time;
+  _stats.reset();
 
   // tihi, my c++ looks like JS :)
   bool res = [&]() -> bool {
@@ -681,12 +712,26 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   INFO_SCOPE;
 
   FbxAMatrix a = GetGeometry(node);
-
   auto &anim = _animation[node->GetName()];
+
+  if (!g_export_animation) {
+
+    FbxTime cur;
+    cur.SetSecondDouble(0);
+    FbxAMatrix m;
+    m = GetGlobalPosition(node, cur) * a;
+    anim.pos.emplace_back(KeyFrameVec3(0, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
+    if (!translation_only) {
+      anim.rot.emplace_back(KeyFrameVec4(0, max_to_dx(m.GetQ(), true)));
+      anim.scale.emplace_back(KeyFrameVec3(0, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
+    }
+    return true;
+  }
 
   vector<D3DXVECTOR3> pos;
   vector<D3DXVECTOR4> rot;
   vector<D3DXVECTOR3> scale;
+  map<double, FbxAMatrix> anim_cache;
 
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
   for (int i = 0; i <= num_frames; ++i) {
@@ -695,6 +740,7 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
     cur.SetSecondDouble(cur_time);
     FbxAMatrix m;
     m = GetGlobalPosition(node, cur) * a;
+    anim_cache[cur_time] = m;
     pos.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT())));
     rot.emplace_back(max_to_dx(m.GetQ(), true));
     scale.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS())));
@@ -717,29 +763,35 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   FbxAMatrix m;
   for (size_t i = 0; i < pos_frames.size(); ++i) {
     double cur_time = pos_frames[i]*_duration/num_frames;
-    cur.SetSecondDouble(cur_time);
-    m = GetGlobalPosition(node, cur) * a;
+    m = anim_cache[cur_time];
     anim.pos.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
   }
 
   if (!translation_only) {
     for (size_t i = 0; i < rot_frames.size(); ++i) {
       double cur_time = rot_frames[i]*_duration/num_frames;
-      cur.SetSecondDouble(cur_time);
-      m = GetGlobalPosition(node, cur) * a;
+      m = anim_cache[cur_time];
       anim.rot.emplace_back(KeyFrameVec4(cur_time, max_to_dx(m.GetQ(), true)));
     }
 
     for (size_t i = 0; i < scale_frames.size(); ++i) {
       double cur_time = scale_frames[i]*_duration/num_frames;
-      cur.SetSecondDouble(cur_time);
-      m = GetGlobalPosition(node, cur) * a;
+      m = anim_cache[cur_time];
       anim.scale.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
     }
   }
 
   return true;
 }
+
+struct Vector3d {
+  double x, y, z;
+  void assign(const D3DXVECTOR3 &v) {
+    x = v.x;
+    y = v.y;
+    z = v.z;
+  }
+};
 
 bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
@@ -791,12 +843,15 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   for (int i = 0; i < layer->GetUVSetCount(); ++i)
     uv_sets.push_back(layer->GetUVSets()[i]->GetName());
 
-  auto mesh = unique_ptr<Mesh>(new Mesh(fbx_node->GetName()));
+  Mesh *mesh = new Mesh(fbx_node->GetName());
 
   if (polys_by_material.size() > 1)
     add_verbose("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
 
   mesh->obj_to_world = max_to_dx(fbx_node->EvaluateGlobalTransform());
+
+  vector<D3DXVECTOR3> verts;
+  verts.reserve(fbx_mesh->GetPolygonVertexCount());
 
   // each material used for the mesh creates a sub mesh
   for (size_t i = 0; i < polys_by_material.size(); ++i) {
@@ -818,7 +873,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
     const string material_name = use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName();
     string submesh_name = polys_by_material.size() > 1 ? to_string("%s_%d", fbx_node->GetName(), i) : fbx_node->GetName();
-    SubMesh *sub_mesh = new SubMesh(submesh_name, material_name, vertex_flags);
+    SubMesh *sub_mesh = new SubMesh(mesh, submesh_name, material_name, vertex_flags);
     mesh->sub_meshes.push_back(std::unique_ptr<SubMesh>(sub_mesh));
 
     auto material_it = _scene.materials_by_name.find(material_name);
@@ -837,6 +892,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
         auto pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
+        auto pos3 = drop<D3DXVECTOR4, D3DXVECTOR3>(pos);
+        verts.push_back(pos3);
         FbxVector4 normal2;
         fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal2);
         auto normal = max_to_dx(normal2);
@@ -856,7 +913,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         set<SuperVertex>::iterator it = super_verts.find(cand);
         if (it == super_verts.end()) {
           idx = cand.idx = sub_mesh->pos.size();
-          sub_mesh->pos.push_back(drop<D3DXVECTOR4, D3DXVECTOR3>(pos));
+          sub_mesh->pos.push_back(pos3);
           sub_mesh->normal.push_back(drop<D3DXVECTOR4, D3DXVECTOR3>(normal));
           if (vertex_flags & SubMesh::kTex0) sub_mesh->tex0.push_back(cand.uv[0]);
           if (vertex_flags & SubMesh::kTex1) sub_mesh->tex1.push_back(cand.uv[1]);
@@ -870,7 +927,30 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     }
   }
 
-  _scene.meshes.push_back(move(mesh));
+  // calc center and extents
+  Vector3d min_pos, max_pos;
+  min_pos.assign(verts[0]);
+  max_pos.assign(verts[0]);
+
+  for (size_t i = 1; i < verts.size(); ++i) {
+    auto &cur = verts[i];
+    min_pos.x = min(min_pos.x, cur.x);
+    min_pos.y = min(min_pos.y, cur.y);
+    min_pos.z = min(min_pos.z, cur.z);
+    max_pos.x = max(max_pos.x, cur.x);
+    max_pos.y = max(max_pos.y, cur.y);
+    max_pos.z = max(max_pos.z, cur.z);
+  }
+
+  mesh->center.x = (float)(max_pos.x + min_pos.x) / 2;
+  mesh->center.y = (float)(max_pos.y + min_pos.y) / 2;
+  mesh->center.z = (float)(max_pos.z + min_pos.z) / 2;
+
+  mesh->extents.x = (float)(max_pos.x - mesh->center.x);
+  mesh->extents.y = (float)(max_pos.y - mesh->center.y);
+  mesh->extents.z = (float)(max_pos.z - mesh->center.z);
+
+  _scene.meshes.push_back(unique_ptr<Mesh>(mesh));
 
   if (!process_animation(fbx_node, false))
     return false;
@@ -978,6 +1058,8 @@ bool FbxConverter::save_scene(const char *dst) {
   ADD_INFO(Animation, binary_ofs, animation_ofs);
   ADD_INFO(Binary, total_size, binary_ofs);
 #undef ADD_INFO
+
+  _stats.print();
 
   return true;
 }
@@ -1128,6 +1210,8 @@ bool FbxConverter::save_meshes() {
     auto &mesh = meshes[i];
     _writer->add_deferred_string(mesh->name);
     _writer->write(mesh->obj_to_world);
+    _writer->write(mesh->center);
+    _writer->write(mesh->extents);
 
     _writer->write((int)mesh->sub_meshes.size());
     for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
@@ -1145,6 +1229,12 @@ bool FbxConverter::save_meshes() {
       _writer->write(index_size);
       _writer->add_deferred_binary(vb.data(), vb.size());
       _writer->add_deferred_binary(ib.data(), ib.size());
+
+      _stats.num_indices += sub->indices.size();
+      _stats.num_verts += sub->pos.size();
+      _stats.vert_data_size += vb.size();
+      _stats.index_data_size += ib.size();
+
     }
   }
 
@@ -1357,6 +1447,8 @@ int parse_cmd_line(LPSTR lpCmdLine) {
   for (int i = 0; i < argc - 2; ++i) {
     g_verbose     |= tokens[i] == "--verbose";
     g_file_watch  |= tokens[i] == "--watch";
+    if (tokens[i] == "--no-anim")
+      g_export_animation = false;
   }
 
   g_src = tokens[argc-2].c_str();
@@ -1431,31 +1523,101 @@ DWORD WINAPI WatcherThread(LPVOID param) {
   return 0;
 }
 
+
+void FbxConverter::compact_vertex_data(const SubMesh &submesh, vector<char> *data) {
+  int len = submesh.element_size * submesh.pos.size();
+  data->resize(len);
+  char *buf = data->data();
+
+  Mesh *mesh = submesh.mesh;
+#define SET_INC(type, src) { *(type *)buf = src; buf += sizeof(type); }
+  for (size_t i = 0; i < submesh.pos.size(); ++i) {
+
+    // save vertices as 16 bit
+    D3DXVECTOR3 ofs = submesh.pos[i] - mesh->center;
+    ofs.x /= (fabs(mesh->extents.x) > 0.001f ? mesh->extents.x : 1);
+    ofs.y /= (fabs(mesh->extents.y) > 0.001f ? mesh->extents.y : 1);
+    ofs.z /= (fabs(mesh->extents.z) > 0.001f ? mesh->extents.z : 1);
+
+    assert(ofs.x >= -1 && ofs.x <= 1);
+    assert(ofs.y >= -1 && ofs.y <= 1);
+    assert(ofs.z >= -1 && ofs.z <= 1);
+
+    int16 x = (int16)(32767 * ofs.x);
+    int16 y = (int16)(32767 * ofs.y);
+    int16 z = (int16)(32767 * ofs.z);
+    SET_INC(int16, x);
+    SET_INC(int16, y);
+    SET_INC(int16, z);
+
+    // save normal as 1+14 bit x, 1+15 bit y, and 1 sign bit for z
+    D3DXVECTOR3 n = submesh.normal[i];
+    D3DXVec3Normalize(&n, &n);
+    int neg_x = n.x < 0 ? 1 : 0;
+    int neg_y = n.y < 0 ? 1 : 0;
+    int neg_z = n.z < 0 ? 1 : 0;
+    int nx = (int)fabs(16383 * n.x);
+    int ny = (int)fabs(32767 * n.y);
+    uint32 normal = 
+      (neg_x << 31) | (nx << 17) |
+      (neg_y << 16) | (ny <<  1) |
+      (neg_z);
+    SET_INC(uint32, normal);
+
+    if (submesh.vertex_flags & SubMesh::kTex0) {
+      SET_INC(D3DXVECTOR2, submesh.tex0[i]);
+    }
+    if (submesh.vertex_flags & SubMesh::kTex1) {
+      SET_INC(D3DXVECTOR2, submesh.tex1[i]);
+    }
+  }
+  data->resize(buf - data->data());
+}
+
+
+void FbxConverter::compact_index_data(const SubMesh &submesh, vector<char> *data, int *index_size) {
+  // check if we need 16 or 32 bit indices
+  const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
+  const size_t elems = submesh.indices.size();
+  const bool need_32_bit = num_verts >= (1 << 16);
+  *index_size = need_32_bit ? 4 : 2;
+  int bits_needed = num_bits(num_verts);
+  int bits_used = need_32_bit ? 32 : 16;
+  _stats.index_slack += ((bits_used - bits_needed) * elems) / 8;
+  int len = elems * (*index_size);
+  data->resize(len);
+  char *buf = data->data();
+  if (need_32_bit)
+    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
+  else
+    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
   switch (msg) {
 
-    case WM_TIMER:
-      if (wparam == FILE_CHANGED_TIMER_ID) {
-        PostMessage(hwnd, WM_USER_CONVERT_FILE, 0, 0);
-        return 0;
-      }
-      break;
-
-    case WM_DESTROY:
-      PostQuitMessage(0);
-      return 0;
-
-    case WM_USER_CONVERT_FILE: {
-
-      KillTimer(g_hwnd, FILE_CHANGED_TIMER_ID);
-      g_converter = new FbxConverter();
-      if (!g_converter->convert(g_src.c_str(), g_dst.c_str())) {
-        PostQuitMessage(1);
-      }
-      SAFE_DELETE(g_converter);
+  case WM_TIMER:
+    if (wparam == FILE_CHANGED_TIMER_ID) {
+      PostMessage(hwnd, WM_USER_CONVERT_FILE, 0, 0);
       return 0;
     }
+    break;
+
+  case WM_DESTROY:
+    PostQuitMessage(0);
+    return 0;
+
+  case WM_USER_CONVERT_FILE: {
+
+    KillTimer(g_hwnd, FILE_CHANGED_TIMER_ID);
+    g_converter = new FbxConverter();
+    if (!g_converter->convert(g_src.c_str(), g_dst.c_str())) {
+      PostQuitMessage(1);
+    }
+    SAFE_DELETE(g_converter);
+    return 0;
+                             }
 
   }
 
@@ -1504,25 +1666,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
           // keyup
           switch (inputs[i].Event.KeyEvent.wVirtualKeyCode) {
 
-            case VK_ESCAPE:
-              msg.wParam = 0;
-              done = true;
-              break;
+          case VK_ESCAPE:
+            msg.wParam = 0;
+            done = true;
+            break;
 
-            case 'F':
-              // force reparse
-              SendMessage(g_hwnd, WM_USER_CONVERT_FILE, 0, 0);
-              break;
+          case 'F':
+            // force reparse
+            SendMessage(g_hwnd, WM_USER_CONVERT_FILE, 0, 0);
+            break;
 
-            case 'V':
-              g_verbose = !g_verbose;
-              printf("** VERBOSE: %s\n", g_verbose ? "on" : "off");
-              break;
+          case 'V':
+            g_verbose = !g_verbose;
+            printf("** VERBOSE: %s\n", g_verbose ? "on" : "off");
+            break;
           }
         }
       }
     }
-      
+
     SetEvent(g_quit_event);
     WaitForSingleObject(thread, INFINITE);
 
@@ -1536,73 +1698,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   FreeConsole();
 
   return msg.wParam;
-}
-
-void FbxConverter::compact_vertex_data(const SubMesh &submesh, vector<char> *data) {
-  int len = submesh.element_size * submesh.pos.size();
-  data->resize(len);
-  char *buf = data->data();
-
-  //add_verbose("*** COMPACT ***");
-
-#define SET_INC(type, src) { *(type *)buf = src; buf += sizeof(type); }
-  for (size_t i = 0; i < submesh.pos.size(); ++i) {
-    SET_INC(D3DXVECTOR3, submesh.pos[i]);
-    // save normal as 1+14 bit x, 1+15 bit y, and 1 sign bit for z
-    D3DXVECTOR3 n = submesh.normal[i];
-    D3DXVec3Normalize(&n, &n);
-    int neg_x = n.x < 0 ? 1 : 0;
-    int neg_y = n.y < 0 ? 1 : 0;
-    int neg_z = n.z < 0 ? 1 : 0;
-    int nx = (int)fabs(16383 * n.x);
-    int ny = (int)fabs(32767 * n.y);
-    uint32 normal = 
-      (neg_x << 31) | (nx << 17) |
-      (neg_y << 16) | (ny <<  1) |
-      (neg_z);
-    SET_INC(uint32, normal);
-/*
-    {
-      D3DXVECTOR3 n2;
-      bool neg_x = !!(normal & (1 << 31));
-      bool neg_y = !!(normal & (1 << 16));
-      bool neg_z = !!(normal & 1);
-
-      n2.x = (neg_x ? -1 : 1) * (((normal >> 17) & 0x3fff) / 16383.0f);
-      n2.y = (neg_y ? -1 : 1) * (((normal >>  1) & 0x7fff) / 32767.0f);
-      n2.z = (neg_z ? -1 : 1) * (sqrtf(1 - n2.x * n2.x - n2.y * n2.y));
-      D3DXVec3Normalize(&n2, &n2);
-
-      D3DXVECTOR3 d;
-      D3DXVec3Subtract(&d, &n, &n2);
-      if (D3DXVec3Length(&d) > 0.1f) {
-        int a = 10;
-      }
-    }
-*/
-    //add_verbose("%.8x, %f, %f, %f", normal, n.x, n.y, n.z);
-
-    if (submesh.vertex_flags & SubMesh::kTex0) {
-      SET_INC(D3DXVECTOR2, submesh.tex0[i]);
-    }
-    if (submesh.vertex_flags & SubMesh::kTex1) {
-      SET_INC(D3DXVECTOR2, submesh.tex1[i]);
-    }
-  }
-  data->resize(buf - data->data());
-}
-
-void FbxConverter::compact_index_data(const SubMesh &submesh, vector<char> *data, int *index_size) {
-  // check if we need 16 or 32 bit indices
-  const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
-  const size_t elems = submesh.indices.size();
-  const bool need_32_bit = num_verts >= (1 << 16);
-  *index_size = need_32_bit ? 4 : 2;
-  int len = elems * (*index_size);
-  data->resize(len);
-  char *buf = data->data();
-  if (need_32_bit)
-    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
-  else
-    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
 }
