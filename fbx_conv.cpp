@@ -94,6 +94,21 @@ Num indices: 374208
 Vertex data size: 723088
 Index data size: 420982
 
+
+Compressed animation data
+** INFO **
+Total size: 2149073
+Material size: 1188 (0.00 Mb)
+Mesh size: 43836 (0.04 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 5416 (0.01 Mb)
+Binary size: 2098321 (2.00 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 723088
+Index data size: 420982
+
 */
 
 #include "stdafx.h"
@@ -110,6 +125,11 @@ class FbxConverter;
 bool g_verbose;
 bool g_export_animation = true;
 bool g_optimzed_mesh = true;
+
+int g_position_bits = 14;
+int g_normal_bits = 11;
+int g_texcoord_bits = 10;
+int g_animation_bits = 16;
 
 bool g_file_watch;
 FbxConverter *g_converter;
@@ -142,6 +162,41 @@ static int num_bits(int a) {
   while (a > (1 << res) - 1)
     ++res;
   return res;
+}
+
+uint32 quantize(float value, int num_bits) {
+  // assume value is in the [-1..1] range
+  uint32 scale = (1 << (num_bits-1)) - 1;
+  uint32 v = (uint32)(scale * fabs(value));
+  if (value < 0)
+    v = set_bit(v, num_bits - 1);
+  return v;
+}
+
+void compute_extents(const std::vector<D3DXVECTOR3> &verts, D3DXVECTOR3 *center, D3DXVECTOR3 *extents) {
+  D3DXVECTOR3 min_value, max_value;
+  min_value = max_value = verts[0];
+  for (size_t i = 1; i < verts.size(); ++i) {
+    auto &cur = verts[i];
+    D3DXVec3Minimize(&min_value, &min_value, &cur);
+    D3DXVec3Maximize(&max_value, &max_value, &cur);
+  }
+
+  *center = 0.5f * (min_value + max_value);
+  *extents = max_value - *center;
+}
+
+void compute_extents(const std::vector<D3DXVECTOR4> &verts, D3DXVECTOR4 *center, D3DXVECTOR4 *extents) {
+  D3DXVECTOR4 min_value, max_value;
+  min_value = max_value = verts[0];
+  for (size_t i = 1; i < verts.size(); ++i) {
+    auto &cur = verts[i];
+    D3DXVec4Minimize(&min_value, &min_value, &cur);
+    D3DXVec4Maximize(&max_value, &max_value, &cur);
+  }
+
+  *center = 0.5f * (min_value + max_value);
+  *extents = max_value - *center;
 }
 
 
@@ -469,8 +524,10 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
   add_verbose("found camera: %s", c->name.c_str());
 
-  if (!process_animation(node, true))
+  if (!process_animation(node, true)) {
+    add_error("error processing animation: %s", c->name.c_str());
     return false;
+  }
 
   FbxNode *target = node->GetTarget();
   if (!target) {
@@ -478,8 +535,10 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
     return false;
   }
 
-  if (!process_animation(target, true))
+  if (!process_animation(target, true)) {
+    add_error("error processing animation: %s", target->GetName());
     return false;
+  }
 
   _scene.cameras.push_back(move(c));
   return true;
@@ -790,11 +849,11 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   }
 
   auto vec3_dist = [&](const D3DXVECTOR3 &a, const D3DXVECTOR3 &b) -> float { 
-    D3DXVECTOR3 d; D3DXVec3Subtract(&d, &a, &b); return D3DXVec3Length(&d);
+    D3DXVECTOR3 d = a - b; return D3DXVec3Length(&d);
   };
 
   auto vec4_dist = [&](const D3DXVECTOR4 &a, const D3DXVECTOR4 &b) -> float { 
-    D3DXVECTOR4 d; D3DXVec4Subtract(&d, &a, &b); return D3DXVec4Length(&d);
+    D3DXVECTOR4 d = a - b; return D3DXVec4Length(&d);
   };
 
   // simplify the keyframes
@@ -826,15 +885,6 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
 
   return true;
 }
-
-struct Vector3d {
-  double x, y, z;
-  void assign(const D3DXVECTOR3 &v) {
-    x = v.x;
-    y = v.y;
-    z = v.z;
-  }
-};
 
 bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
@@ -1004,27 +1054,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   }
 
   // calc center and extents
-  Vector3d min_pos, max_pos;
-  min_pos.assign(verts[0]);
-  max_pos.assign(verts[0]);
-
-  for (size_t i = 1; i < verts.size(); ++i) {
-    auto &cur = verts[i];
-    min_pos.x = min<double>(min_pos.x, cur.x);
-    min_pos.y = min<double>(min_pos.y, cur.y);
-    min_pos.z = min<double>(min_pos.z, cur.z);
-    max_pos.x = max<double>(max_pos.x, cur.x);
-    max_pos.y = max<double>(max_pos.y, cur.y);
-    max_pos.z = max<double>(max_pos.z, cur.z);
-  }
-
-  mesh->center.x = (float)(max_pos.x + min_pos.x) / 2;
-  mesh->center.y = (float)(max_pos.y + min_pos.y) / 2;
-  mesh->center.z = (float)(max_pos.z + min_pos.z) / 2;
-
-  mesh->extents.x = (float)(max_pos.x - mesh->center.x);
-  mesh->extents.y = (float)(max_pos.y - mesh->center.y);
-  mesh->extents.z = (float)(max_pos.z - mesh->center.z);
+  compute_extents(verts, &mesh->center, &mesh->extents);
 
   _scene.meshes.push_back(unique_ptr<Mesh>(mesh));
 
@@ -1081,40 +1111,38 @@ bool FbxConverter::save_scene(const char *dst) {
   // the scene is saved so it can be read in a single sequential read,
   // and then a simple fixup applied to the pointers
 
-  if (!_writer->open(dst))
-    return false;
+#define CHECKED_CALL(x) if (!(x)) { add_error("Error in " #x); return false; }
+
+  CHECKED_CALL(_writer->open(dst));
 
   MainHeader header;
   header.version = FILE_VERSION;
   _writer->push_pos();
   _writer->write(header);
+  header.position_bits = g_position_bits;
+  header.normal_bits = g_normal_bits;
+  header.texcoord_bits = g_texcoord_bits;
+  header.animation_bits = g_animation_bits;
 
   header.global_ofs = _writer->pos();
-  if (!save_globals())
-    return false;
+  CHECKED_CALL(save_globals());
 
   header.material_ofs = _writer->pos();
-  if (!save_materials())
-    return false;
+  CHECKED_CALL(save_materials());
 
-  if (!save_material_info())
-    return false;
+  CHECKED_CALL(save_material_info());
 
   header.mesh_ofs = _writer->pos();
-  if (!save_meshes())
-    return false;
+  CHECKED_CALL(save_meshes());
 
   header.light_ofs = _writer->pos();
-  if (!save_lights())
-    return false;
+  CHECKED_CALL(save_lights());
 
   header.camera_ofs = _writer->pos();
-  if (!save_cameras())
-    return false;
+  CHECKED_CALL(save_cameras());
 
   header.animation_ofs = _writer->pos();
-  if (!save_animations())
-    return false;
+  CHECKED_CALL(save_animations());
 
   header.binary_ofs = _writer->pos();
   _writer->save_binary();
@@ -1169,28 +1197,85 @@ void prune_animations(map<string, vector<KeyFrame<T>>> *anims) {
   }
 }
 
-template<class T> 
-bool FbxConverter::save_animations(const map<string, vector<KeyFrame<T>>> &anims) {
+bool FbxConverter::save_animations(const vector<KeyFrameVec3> &frames) {
 
-  _writer->write((int)anims.size());
+  BitWriter writer;
 
-  for (auto it = begin(anims); it != end(anims); ++it) {
-    const string &node_name = it->first;
-    auto &frames = it->second;
-    _writer->add_deferred_string(node_name);
-    _writer->write((int)frames.size());
-    _writer->write_raw(&frames[0], sizeof(frames[0]) * frames.size());
+  writer.write_varint(frames.size());
+  if (frames.size() > 0) {
+
+    vector<D3DXVECTOR3> values(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i)
+      values[i] = frames[i].value;
+
+    D3DXVECTOR3 center, extents;
+    compute_extents(values, &center, &extents);
+
+    writer.write(*(uint32 *)&center.x, 32);
+    writer.write(*(uint32 *)&center.y, 32);
+    writer.write(*(uint32 *)&center.z, 32);
+
+    writer.write(*(uint32 *)&extents.x, 32);
+    writer.write(*(uint32 *)&extents.y, 32);
+    writer.write(*(uint32 *)&extents.z, 32);
+
+    for (size_t i = 0; i < frames.size(); ++i) {
+      float t = (float)frames[i].time;
+      writer.write(*(uint32 *)&t, 32);
+      const D3DXVECTOR3 &cur = frames[i].value;
+      writer.write(quantize((cur.x - center.x) / extents.x, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.y - center.y) / extents.y, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.z - center.z) / extents.z, g_animation_bits), g_animation_bits);
+    }
   }
+
+  uint32 bit_len;
+  uint8 *buf;
+  writer.get_stream(&buf, &bit_len);
+  _writer->add_deferred_binary(buf, (bit_len + 7) / 8);
 
   return true;
 }
 
-template<class T> 
-bool FbxConverter::save_animations(const vector<KeyFrame<T>> &frames) {
+bool FbxConverter::save_animations(const vector<KeyFrameVec4> &frames) {
 
-  _writer->write((int)frames.size());
-  if (frames.size() > 0)
-    _writer->write_raw(&frames[0], sizeof(frames[0]) * frames.size());
+  BitWriter writer;
+
+  writer.write_varint(frames.size());
+  if (frames.size() > 0) {
+
+    vector<D3DXVECTOR4> values(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i)
+      values[i] = frames[i].value;
+
+    D3DXVECTOR4 center, extents;
+    compute_extents(values, &center, &extents);
+
+    writer.write(*(uint32 *)&center.x, 32);
+    writer.write(*(uint32 *)&center.y, 32);
+    writer.write(*(uint32 *)&center.z, 32);
+    writer.write(*(uint32 *)&center.w, 32);
+
+    writer.write(*(uint32 *)&extents.x, 32);
+    writer.write(*(uint32 *)&extents.y, 32);
+    writer.write(*(uint32 *)&extents.z, 32);
+    writer.write(*(uint32 *)&extents.w, 32);
+
+    for (size_t i = 0; i < frames.size(); ++i) {
+      float t = (float)frames[i].time;
+      writer.write(*(uint32 *)&t, 32);
+      const D3DXVECTOR4 &cur = frames[i].value;
+      writer.write(quantize((cur.x - center.x) / extents.x, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.y - center.y) / extents.y, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.z - center.z) / extents.z, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.w - center.w) / extents.w, g_animation_bits), g_animation_bits);
+    }
+  }
+
+  uint32 bit_len;
+  uint8 *buf;
+  writer.get_stream(&buf, &bit_len);
+  _writer->add_deferred_binary(buf, (bit_len + 7) / 8);
 
   return true;
 }
@@ -1203,23 +1288,16 @@ bool FbxConverter::save_animations() {
   for (auto it = begin(_animation); it != end(_animation); ++it) {
     auto &name = it->first;
     auto &anim = it->second;
+
     if (!anim.pos.empty() || !anim.rot.empty() || !anim.scale.empty()) {
       _writer->add_deferred_string(name);
-      save_animations<D3DXVECTOR3>(anim.pos);
-      save_animations<D3DXVECTOR4>(anim.rot);
-      save_animations<D3DXVECTOR3>(anim.scale);
+      add_verbose("anim: %s", name.c_str());
+      save_animations(anim.pos);
+      save_animations(anim.rot);
+      save_animations(anim.scale);
     }
   }
 
-/*
-  prune_animations(&_animation_float);
-  prune_animations(&_animation_vec3);
-  prune_animations(&_animation_mtx);
-
-  save_animations<float>(_animation_float);
-  save_animations<D3DXVECTOR3>(_animation_vec3);
-  save_animations<D3DXMATRIX>(_animation_mtx);
-*/
   return true;
 }
 
@@ -1614,14 +1692,6 @@ DWORD WINAPI WatcherThread(LPVOID param) {
   return 0;
 }
 
-uint32 quantize(float value, int num_bits) {
-  // assume value is in the [-1..1] range
-  uint32 scale = (1 << (num_bits-1)) - 1;
-  uint32 v = (uint32)(scale * fabs(value));
-  if (value < 0)
-    v = set_bit(v, num_bits - 1);
-  return v;
-}
 
 void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer) {
   int len = submesh->element_size * submesh->pos.size();
@@ -1643,25 +1713,25 @@ void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer
     assert(ofs.y >= -1 && ofs.y <= 1);
     assert(ofs.z >= -1 && ofs.z <= 1);
 
-    writer->write(quantize(ofs.x, 14), 14);
-    writer->write(quantize(ofs.y, 14), 14);
-    writer->write(quantize(ofs.z, 14), 14);
+    writer->write(quantize(ofs.x, g_position_bits), g_position_bits);
+    writer->write(quantize(ofs.y, g_position_bits), g_position_bits);
+    writer->write(quantize(ofs.z, g_position_bits), g_position_bits);
 
     // save normal as 11 bit x/y, and 1 sign bit for z
     D3DXVECTOR3 n = submesh->normal[i];
     D3DXVec3Normalize(&n, &n);
-    writer->write(quantize(n.x, 11), 11);
-    writer->write(quantize(n.y, 11), 11);
+    writer->write(quantize(n.x, g_normal_bits), g_normal_bits);
+    writer->write(quantize(n.y, g_normal_bits), g_normal_bits);
     writer->write(n.z < 0 ? 1 : 0, 1);
 
     if (submesh->vertex_flags & SubMesh::kTex0) {
       // 11 bit u/v
-      writer->write(quantize(submesh->tex0[i].x, 11), 11);
-      writer->write(quantize(submesh->tex0[i].y, 11), 11);
+      writer->write(quantize(submesh->tex0[i].x, g_texcoord_bits), g_texcoord_bits);
+      writer->write(quantize(submesh->tex0[i].y, g_texcoord_bits), g_texcoord_bits);
     }
     if (submesh->vertex_flags & SubMesh::kTex1) {
-      writer->write(quantize(submesh->tex1[i].x, 11), 11);
-      writer->write(quantize(submesh->tex1[i].y, 11), 11);
+      writer->write(quantize(submesh->tex1[i].x, g_texcoord_bits), g_texcoord_bits);
+      writer->write(quantize(submesh->tex1[i].y, g_texcoord_bits), g_texcoord_bits);
     }
   }
 }

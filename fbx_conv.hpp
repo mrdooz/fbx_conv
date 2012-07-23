@@ -5,6 +5,10 @@
 #pragma pack(push, 1)
 struct MainHeader {
   int version;
+  int position_bits;
+  int normal_bits;
+  int texcoord_bits;
+  int animation_bits;
   int global_ofs;
   int material_ofs;
   int mesh_ofs;
@@ -254,8 +258,8 @@ private:
   bool save_meshes();
   bool save_cameras();
 
-  template<class T> bool save_animations(const std::map<std::string, std::vector<KeyFrame<T>>> &anims);
-  template<class T> bool save_animations(const std::vector<KeyFrame<T>> &frames);
+  bool save_animations(const std::vector<KeyFrameVec3> &frames);
+  bool save_animations(const std::vector<KeyFrameVec4> &frames);
   bool save_animations();
   bool save_lights();
   bool save_materials();
