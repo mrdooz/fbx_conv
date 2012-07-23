@@ -10,35 +10,6 @@ typedef int64_t int64;
 
 using namespace std;
 
-uint32 set_bit(uint32 value, int bit_num) {
-  return (value | 1 << bit_num);
-}
-
-bool is_bit_set(uint32 value, int bit_num) {
-  return !!(value & (1 << bit_num));
-}
-
-uint32 clear_bit(uint32 value, int bit_num) {
-  return value & ~(1 << bit_num);
-}
-
-int bits_required(uint32 input) {
-  uint32 res = 1;
-  while (input > (1U << res) - 1)
-    ++res;
-  return res;
-}
-
-int compress_value(int value, int bits) {
-  assert(bits_required(value) + 1 <= bits);
-  if (value < 0)
-    value = set_bit(-value, bits - 1);
-  return value;
-}
-
-int expand_value(uint32 value, int bits) {
-  return (is_bit_set(value, bits - 1) ? -1 : 1) * clear_bit(value, bits - 1);
-}
 
 BitReader::BitReader(uint8 *data, uint32 len_in_bits)
   : _length_in_bits(len_in_bits)
@@ -208,6 +179,7 @@ void BitWriter::write(uint32 value, uint32 count) {
   buf[0] = (buf[0] & read_mask[bit_ofs]) | prefix;
 }
 
+#if 0
 #define FUL_ASSERT(x) if (!x) _asm { int 3}
 
 
@@ -290,3 +262,4 @@ int _tmain(int argc, _TCHAR* argv[])
 	return 0;
 }
 
+#endif

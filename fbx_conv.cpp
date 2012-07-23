@@ -52,14 +52,55 @@ Vertex data size: 890062
 Index data size: 748416
 Index slack: 28067
 
+14-bit pos, 11-bit normals, 10-bit texture coords, no optimized indices + zig-zag delta encoded varints
+** INFO **
+Total size: 3348969
+Material size: 1188 (0.00 Mb)
+Mesh size: 43836 (0.04 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 1509465 (1.44 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 723088
+Index data size: 762615
+
+** INFO **
+Total size: 3332707
+Material size: 1188 (0.00 Mb)
+Mesh size: 43836 (0.04 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 1493203 (1.42 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 723088
+Index data size: 746353
+
+
+14-bit pos, 11-bit normals, 10-bit texture coords, optimized indices + zig-zag delta encoded varints
+** INFO **
+Total size: 3007336
+Material size: 1188 (0.00 Mb)
+Mesh size: 43836 (0.04 Mb)
+Light size: 176 (0.00 Mb)
+Camera size: 76 (0.00 Mb)
+Animation size: 1794168 (1.71 Mb)
+Binary size: 1167832 (1.11 Mb)
+Num verts: 88987
+Num indices: 374208
+Vertex data size: 723088
+Index data size: 420982
 
 */
 
 #include "stdafx.h"
 #include "fbx_conv.hpp"
 #include "utils.hpp"
-#include <functional>
-#include <mmsystem.h>
+#include "bitutils.hpp"
+#include "optimize.hpp"
 
 using namespace std;
 using namespace stdext;
@@ -68,6 +109,8 @@ class FbxConverter;
 
 bool g_verbose;
 bool g_export_animation = true;
+bool g_optimzed_mesh = true;
+
 bool g_file_watch;
 FbxConverter *g_converter;
 string g_src_path;
@@ -925,6 +968,39 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         sub_mesh->indices.push_back(idx);
       }
     }
+
+    if (g_optimzed_mesh) {
+      vector<int> optimized_indices;
+      vector<int> vertex_reorder;
+      VertexOptimizer opt(sub_mesh->pos.size());
+      opt.AddTriangles(sub_mesh->indices.data(), sub_mesh->indices.size(), &optimized_indices, &vertex_reorder);
+      assert(sub_mesh->indices.size() == optimized_indices.size());
+
+      // we need to reorder the pos/normal etc now to match the new optimized order
+      vector<D3DXVECTOR3> opt_pos(sub_mesh->pos.size());
+      vector<D3DXVECTOR3> opt_normal(sub_mesh->normal.size());
+
+      for (size_t i = 0; i < sub_mesh->pos.size(); ++i) {
+        int idx = vertex_reorder[i];
+        opt_pos[idx] = sub_mesh->pos[i];
+        opt_normal[idx] = sub_mesh->normal[i];
+      }
+
+      sub_mesh->pos = opt_pos;
+      sub_mesh->normal = opt_normal;
+
+      if (!sub_mesh->tex0.empty()) {
+        vector<D3DXVECTOR2> opt_tex0(sub_mesh->tex0.size());
+        for (size_t i = 0; i < sub_mesh->pos.size(); ++i) {
+          int idx = vertex_reorder[i];
+          opt_tex0[idx] = sub_mesh->tex0[i];
+        }
+        sub_mesh->tex0 = opt_tex0;
+      }
+
+      sub_mesh->indices = optimized_indices;
+    }
+
   }
 
   // calc center and extents
@@ -934,12 +1010,12 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
   for (size_t i = 1; i < verts.size(); ++i) {
     auto &cur = verts[i];
-    min_pos.x = min(min_pos.x, cur.x);
-    min_pos.y = min(min_pos.y, cur.y);
-    min_pos.z = min(min_pos.z, cur.z);
-    max_pos.x = max(max_pos.x, cur.x);
-    max_pos.y = max(max_pos.y, cur.y);
-    max_pos.z = max(max_pos.z, cur.z);
+    min_pos.x = min<double>(min_pos.x, cur.x);
+    min_pos.y = min<double>(min_pos.y, cur.y);
+    min_pos.z = min<double>(min_pos.z, cur.z);
+    max_pos.x = max<double>(max_pos.x, cur.x);
+    max_pos.y = max<double>(max_pos.y, cur.y);
+    max_pos.z = max<double>(max_pos.z, cur.z);
   }
 
   mesh->center.x = (float)(max_pos.x + min_pos.x) / 2;
@@ -1220,20 +1296,33 @@ bool FbxConverter::save_meshes() {
       _writer->add_deferred_string(sub->material);
 
       int index_size;
-      vector<char> vb, ib;
-      compact_vertex_data(*sub, &vb);
-      compact_index_data(*sub, &ib, &index_size);
+      BitWriter vb_writer;
+      BitWriter ib_writer;
+
+      compact_vertex_data(sub, &vb_writer);
+      compact_index_data(sub, &ib_writer, &index_size);
 
       _writer->write(sub->vertex_flags);
       _writer->write(sub->element_size);
       _writer->write(index_size);
-      _writer->add_deferred_binary(vb.data(), vb.size());
-      _writer->add_deferred_binary(ib.data(), ib.size());
+
+      _writer->write((int)sub->pos.size());
+      _writer->write((int)sub->indices.size());
+
+      uint8 *vb, *ib;
+      uint32 vb_len, ib_len;
+      vb_writer.get_stream(&vb, &vb_len);
+      ib_writer.get_stream(&ib, &ib_len);
+      _writer->add_deferred_binary(vb, (vb_len + 7) / 8);
+      _writer->add_deferred_binary(ib, (ib_len + 7) / 8);
 
       _stats.num_indices += sub->indices.size();
       _stats.num_verts += sub->pos.size();
-      _stats.vert_data_size += vb.size();
-      _stats.index_data_size += ib.size();
+      _stats.vert_data_size += (vb_len + 7) / 8;
+      _stats.index_data_size += (ib_len + 7) / 8;
+
+      if (ib_len > sub->indices.size() * 10)
+        int a = 10;
 
     }
   }
@@ -1449,6 +1538,8 @@ int parse_cmd_line(LPSTR lpCmdLine) {
     g_file_watch  |= tokens[i] == "--watch";
     if (tokens[i] == "--no-anim")
       g_export_animation = false;
+    if (tokens[i] == "--no-opt")
+      g_optimzed_mesh = false;
   }
 
   g_src = tokens[argc-2].c_str();
@@ -1523,18 +1614,27 @@ DWORD WINAPI WatcherThread(LPVOID param) {
   return 0;
 }
 
+uint32 quantize(float value, int num_bits) {
+  // assume value is in the [-1..1] range
+  uint32 scale = (1 << (num_bits-1)) - 1;
+  uint32 v = (uint32)(scale * fabs(value));
+  if (value < 0)
+    v = set_bit(v, num_bits - 1);
+  return v;
+}
 
-void FbxConverter::compact_vertex_data(const SubMesh &submesh, vector<char> *data) {
-  int len = submesh.element_size * submesh.pos.size();
-  data->resize(len);
-  char *buf = data->data();
+void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer) {
+  int len = submesh->element_size * submesh->pos.size();
 
-  Mesh *mesh = submesh.mesh;
-#define SET_INC(type, src) { *(type *)buf = src; buf += sizeof(type); }
-  for (size_t i = 0; i < submesh.pos.size(); ++i) {
-
-    // save vertices as 16 bit
-    D3DXVECTOR3 ofs = submesh.pos[i] - mesh->center;
+  Mesh *mesh = submesh->mesh;
+  for (size_t i = 0; i < submesh->pos.size(); ++i) {
+/*
+    add_verbose("%f, %f, %f, %f, %f, %f", 
+      submesh->pos[i].x, submesh->pos[i].y, submesh->pos[i].z, 
+      submesh->normal[i].x, submesh->normal[i].y, submesh->normal[i].z);
+*/
+    // save vertices as 14 bit
+    D3DXVECTOR3 ofs = submesh->pos[i] - mesh->center;
     ofs.x /= (fabs(mesh->extents.x) > 0.001f ? mesh->extents.x : 1);
     ofs.y /= (fabs(mesh->extents.y) > 0.001f ? mesh->extents.y : 1);
     ofs.z /= (fabs(mesh->extents.z) > 0.001f ? mesh->extents.z : 1);
@@ -1543,54 +1643,48 @@ void FbxConverter::compact_vertex_data(const SubMesh &submesh, vector<char> *dat
     assert(ofs.y >= -1 && ofs.y <= 1);
     assert(ofs.z >= -1 && ofs.z <= 1);
 
-    int16 x = (int16)(32767 * ofs.x);
-    int16 y = (int16)(32767 * ofs.y);
-    int16 z = (int16)(32767 * ofs.z);
-    SET_INC(int16, x);
-    SET_INC(int16, y);
-    SET_INC(int16, z);
+    writer->write(quantize(ofs.x, 14), 14);
+    writer->write(quantize(ofs.y, 14), 14);
+    writer->write(quantize(ofs.z, 14), 14);
 
-    // save normal as 1+14 bit x, 1+15 bit y, and 1 sign bit for z
-    D3DXVECTOR3 n = submesh.normal[i];
+    // save normal as 11 bit x/y, and 1 sign bit for z
+    D3DXVECTOR3 n = submesh->normal[i];
     D3DXVec3Normalize(&n, &n);
-    int neg_x = n.x < 0 ? 1 : 0;
-    int neg_y = n.y < 0 ? 1 : 0;
-    int neg_z = n.z < 0 ? 1 : 0;
-    int nx = (int)fabs(16383 * n.x);
-    int ny = (int)fabs(32767 * n.y);
-    uint32 normal = 
-      (neg_x << 31) | (nx << 17) |
-      (neg_y << 16) | (ny <<  1) |
-      (neg_z);
-    SET_INC(uint32, normal);
+    writer->write(quantize(n.x, 11), 11);
+    writer->write(quantize(n.y, 11), 11);
+    writer->write(n.z < 0 ? 1 : 0, 1);
 
-    if (submesh.vertex_flags & SubMesh::kTex0) {
-      SET_INC(D3DXVECTOR2, submesh.tex0[i]);
+    if (submesh->vertex_flags & SubMesh::kTex0) {
+      // 11 bit u/v
+      writer->write(quantize(submesh->tex0[i].x, 11), 11);
+      writer->write(quantize(submesh->tex0[i].y, 11), 11);
     }
-    if (submesh.vertex_flags & SubMesh::kTex1) {
-      SET_INC(D3DXVECTOR2, submesh.tex1[i]);
+    if (submesh->vertex_flags & SubMesh::kTex1) {
+      writer->write(quantize(submesh->tex1[i].x, 11), 11);
+      writer->write(quantize(submesh->tex1[i].y, 11), 11);
     }
   }
-  data->resize(buf - data->data());
 }
 
 
-void FbxConverter::compact_index_data(const SubMesh &submesh, vector<char> *data, int *index_size) {
+void FbxConverter::compact_index_data(const SubMesh *submesh, BitWriter *writer, int *index_size) {
+
   // check if we need 16 or 32 bit indices
-  const size_t num_verts = max4(submesh.pos.size(), submesh.normal.size(), submesh.tex0.size(), submesh.tex1.size());
-  const size_t elems = submesh.indices.size();
+  const size_t num_verts = max4(submesh->pos.size(), submesh->normal.size(), submesh->tex0.size(), submesh->tex1.size());
   const bool need_32_bit = num_verts >= (1 << 16);
   *index_size = need_32_bit ? 4 : 2;
-  int bits_needed = num_bits(num_verts);
-  int bits_used = need_32_bit ? 32 : 16;
-  _stats.index_slack += ((bits_used - bits_needed) * elems) / 8;
-  int len = elems * (*index_size);
-  data->resize(len);
-  char *buf = data->data();
-  if (need_32_bit)
-    copy(RANGE(submesh.indices), checked_array_iterator<uint32 *>((uint32 *)buf, elems));
-  else
-    copy(RANGE(submesh.indices), checked_array_iterator<uint16 *>((uint16 *)buf, elems));
+
+  // compute deltas for indices, zig-zag encode, and save as varints
+  auto &indices = submesh->indices;
+  writer->write_varint(zigzag_encode(indices[0]));
+  int prev = indices[0];
+  for (size_t i = 1; i < indices.size(); ++i) {
+    int cur = indices[i];
+    int delta = cur - prev;
+    int zz = zigzag_encode(delta);
+    writer->write_varint(zz);
+    prev = cur;
+  }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {

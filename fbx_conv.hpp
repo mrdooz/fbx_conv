@@ -1,6 +1,6 @@
 #pragma once
 
-#define FILE_VERSION 12
+#define FILE_VERSION 13
 
 #pragma pack(push, 1)
 struct MainHeader {
@@ -141,7 +141,7 @@ struct SubMesh {
   std::vector<D3DXVECTOR3> normal;
   std::vector<D3DXVECTOR2> tex0;
   std::vector<D3DXVECTOR2> tex1;
-  std::vector<uint32> indices;
+  std::vector<int> indices;
 };
 
 struct Mesh {
@@ -226,6 +226,7 @@ struct MaterialInfo {
   Material *material;
 };
 
+class BitWriter;
 class Writer;
 class FbxConverter;
 extern FbxConverter *g_converter;
@@ -263,8 +264,8 @@ private:
 
   void copy_texture(std::string src, std::string *dst);
 
-  void compact_vertex_data(const SubMesh &submesh, std::vector<char> *data);
-  void compact_index_data(const SubMesh &submesh, std::vector<char> *data, int *index_size);
+  void compact_vertex_data(const SubMesh *submesh, BitWriter *writer);
+  void compact_index_data(const SubMesh *submesh, BitWriter *writer, int *index_size);
 
   void add_error(const char *fmt, ...);
   void add_info(const char *fmt, ...);
@@ -291,7 +292,6 @@ private:
       num_indices = 0;
       vert_data_size = 0;
       index_data_size = 0;
-      index_slack = 0;
     }
 
     void print() {
@@ -299,7 +299,6 @@ private:
       _conv->add_verbose("Num indices: %d", num_indices);
       _conv->add_verbose("Vertex data size: %d", vert_data_size);
       _conv->add_verbose("Index data size: %d", index_data_size);
-      _conv->add_verbose("Index slack: %d", index_slack);
     }
 
     Stats(FbxConverter *conv) : _conv(conv) { reset(); }

@@ -1,5 +1,44 @@
 #pragma once
 
+inline uint32 set_bit(uint32 value, int bit_num) {
+  return (value | 1 << bit_num);
+}
+
+inline bool is_bit_set(uint32 value, int bit_num) {
+  return !!(value & (1 << bit_num));
+}
+
+inline uint32 clear_bit(uint32 value, int bit_num) {
+  return value & ~(1 << bit_num);
+}
+
+inline int bits_required(uint32 input) {
+  uint32 res = 1;
+  while (input > (1U << res) - 1)
+    ++res;
+  return res;
+}
+
+inline int compress_value(int value, int bits) {
+  assert(bits_required(value) + 1 <= bits);
+  if (value < 0)
+    value = set_bit(-value, bits - 1);
+  return value;
+}
+
+inline int expand_value(uint32 value, int bits) {
+  return (is_bit_set(value, bits - 1) ? -1 : 1) * clear_bit(value, bits - 1);
+}
+
+inline uint32 zigzag_encode(int n) {
+  // https://developers.google.com/protocol-buffers/docs/encoding
+  return (n << 1) ^ (n >> 31);
+}
+
+inline int zigzag_decode(int n) {
+  return (n >> 1) ^ (-(n & 1));
+}
+
 class BitReader
 {
 public:
