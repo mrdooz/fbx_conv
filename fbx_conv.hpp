@@ -151,10 +151,13 @@ struct SubMesh {
 struct Mesh {
   Mesh(const std::string &name) : name(name) {}
   std::string name;
-  D3DXMATRIX obj_to_world;
+  D3DXVECTOR3 pos;
+  D3DXVECTOR4 rot;
+  D3DXVECTOR3 scale;
   D3DXVECTOR3 center;
   D3DXVECTOR3 extents;
   std::vector<std::unique_ptr<SubMesh>> sub_meshes;
+  bool is_static;
 };
 
 
@@ -166,6 +169,7 @@ struct Camera {
   FbxDouble fov_x;
   FbxDouble fov_y;
   FbxDouble near_plane, far_plane;
+  bool is_static;
 };
 
 struct Light {
@@ -197,6 +201,7 @@ struct Light {
   D3DXVECTOR3 pos;
   FbxDouble3 color;
   FbxDouble intensity;
+  bool is_static;
 };
 
 struct Hierarchy {
@@ -250,7 +255,7 @@ private:
   bool process_camera(FbxNode *node, FbxCamera *camera);
   bool process_light(FbxNode *node, FbxLight *light);
 
-  bool process_animation(FbxNode *node, bool translation_only);
+  bool process_animation(FbxNode *node, bool translation_only, bool *is_static);
   bool process_position_animation(FbxNode *node);
 
   bool save_scene(const char *dst);

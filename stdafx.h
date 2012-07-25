@@ -40,6 +40,9 @@
 
 #include <boost/algorithm/string.hpp>
 
+#include <Wm5Memory.h>
+#include <Wm5BSplineCurveFit.h>
+
 #define FBXSDK_NEW_API
 #include <fbxsdk.h>
 

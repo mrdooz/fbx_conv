@@ -1,115 +1,5 @@
 // converter between .fbx and .kumi format
 
-/*
-
-Original
-** INFO **
-Total size: 5048642
-Material size: 1188 (0.00 Mb)
-Mesh size: 33212 (0.03 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 3219762 (3.07 Mb)
-
-No unnecessary texture coordinates
-** INFO **
-Total size: 4736938
-Material size: 1188 (0.00 Mb)
-Mesh size: 33212 (0.03 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 2908058 (2.77 Mb)
-
-32-bit normals
-** INFO **
-Total size: 4025042
-Material size: 1188 (0.00 Mb)
-Mesh size: 33212 (0.03 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 2196162 (2.09 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 1423984
-Index data size: 748416
-Index slack: 28067
-
-16-bit pos
-** INFO **
-Total size: 3499088
-Material size: 1188 (0.00 Mb)
-Mesh size: 41180 (0.04 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 1662240 (1.59 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 890062
-Index data size: 748416
-Index slack: 28067
-
-14-bit pos, 11-bit normals, 10-bit texture coords, no optimized indices + zig-zag delta encoded varints
-** INFO **
-Total size: 3348969
-Material size: 1188 (0.00 Mb)
-Mesh size: 43836 (0.04 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 1509465 (1.44 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 723088
-Index data size: 762615
-
-** INFO **
-Total size: 3332707
-Material size: 1188 (0.00 Mb)
-Mesh size: 43836 (0.04 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 1493203 (1.42 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 723088
-Index data size: 746353
-
-
-14-bit pos, 11-bit normals, 10-bit texture coords, optimized indices + zig-zag delta encoded varints
-** INFO **
-Total size: 3007336
-Material size: 1188 (0.00 Mb)
-Mesh size: 43836 (0.04 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 1794168 (1.71 Mb)
-Binary size: 1167832 (1.11 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 723088
-Index data size: 420982
-
-
-Compressed animation data
-** INFO **
-Total size: 2149073
-Material size: 1188 (0.00 Mb)
-Mesh size: 43836 (0.04 Mb)
-Light size: 176 (0.00 Mb)
-Camera size: 76 (0.00 Mb)
-Animation size: 5416 (0.01 Mb)
-Binary size: 2098321 (2.00 Mb)
-Num verts: 88987
-Num indices: 374208
-Vertex data size: 723088
-Index data size: 420982
-
-*/
 
 #include "stdafx.h"
 #include "fbx_conv.hpp"
@@ -124,12 +14,14 @@ class FbxConverter;
 
 bool g_verbose;
 bool g_export_animation = true;
-bool g_optimzed_mesh = true;
+bool g_optimize_mesh = true;
+bool g_optimize_spline = false;
 
 int g_position_bits = 14;
 int g_normal_bits = 11;
 int g_texcoord_bits = 10;
 int g_animation_bits = 16;
+int g_num_control_points = 100;
 
 bool g_file_watch;
 FbxConverter *g_converter;
@@ -156,6 +48,7 @@ template <class T, class U>
 U drop(const T &t) {
   return U(t[0], t[1], t[2]);
 }
+
 
 static int num_bits(int a) {
   int res = 1;
@@ -223,6 +116,47 @@ D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
     *D3DXMatrixScaling(&mtx_s, (float)s[0], (float)s[1], (float)s[2]) * 
     *D3DXMatrixRotationQuaternion(&mtx_r, &D3DXQUATERNION((float)q[0], (float)q[1], (float)q[2], (float)q[3])) *
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
+}
+
+void extract_prs(const FbxAMatrix &mtx, D3DXVECTOR3 *pos, D3DXVECTOR4 *rot, D3DXVECTOR3 *scale) {
+  *pos = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(mtx.GetT()));
+  *rot = max_to_dx(mtx.GetQ(), true);
+  *scale = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(mtx.GetS()));
+}
+
+typedef float AnimType;
+void optimize_spline_fit(int dimension, int num_samples, AnimType *sample_data, AnimType err) {
+  using namespace Wm5;
+  int lo = 5;
+  int hi = num_samples;
+  int cur = 10;
+  while (lo < hi) {
+    BSplineCurveFit<AnimType> fitter(dimension, num_samples, sample_data, 3, cur);
+
+    // compute RMSD
+    AnimType d = 0;
+    for (int i = 0; i < num_samples; ++i) {
+      AnimType v[4];
+      fitter.GetPosition((AnimType)i/(num_samples-1), v);
+      AnimType e = 0;
+      for (int j = 0; j < dimension; ++j) {
+        AnimType c = sample_data[i*dimension+j];
+        e += (c - v[j]) * (c - v[j]);
+      }
+      d += e;
+    }
+    AnimType cur_err = sqrt(d/num_samples);
+    if (cur_err < err) {
+      hi = cur;
+    } else {
+      if (lo == cur) {
+        cur = hi;
+        break;
+      }
+      lo = cur;
+    }
+    cur = (lo + hi) / 2;
+  }
 }
 
 
@@ -373,7 +307,7 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *fbx_light) {
 
   add_verbose("found light: %s", light->name.c_str());
 
-  if (!process_animation(node, true))
+  if (!process_animation(node, true, &light->is_static))
     return false;
 
   return true;
@@ -524,7 +458,8 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
   add_verbose("found camera: %s", c->name.c_str());
 
-  if (!process_animation(node, true)) {
+  bool static_camera;
+  if (!process_animation(node, true, &static_camera)) {
     add_error("error processing animation: %s", c->name.c_str());
     return false;
   }
@@ -535,10 +470,13 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
     return false;
   }
 
-  if (!process_animation(target, true)) {
+  bool static_target;
+  if (!process_animation(target, true, &static_target)) {
     add_error("error processing animation: %s", target->GetName());
     return false;
   }
+
+  c->is_static = static_camera | static_target;
 
   _scene.cameras.push_back(move(c));
   return true;
@@ -810,14 +748,18 @@ vector<int> remove_keyframes(const vector<T> &org, const function<float(const T&
   return res;
 }
 
-bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
+bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool *is_static) {
   INFO_SCOPE;
+
+  if (!g_export_animation) {
+    *is_static = true;
+    return true;
+  }
 
   FbxAMatrix a = GetGeometry(node);
   auto &anim = _animation[node->GetName()];
 
   if (!g_export_animation) {
-
     FbxTime cur;
     cur.SetSecondDouble(0);
     FbxAMatrix m;
@@ -855,6 +797,12 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only) {
   auto vec4_dist = [&](const D3DXVECTOR4 &a, const D3DXVECTOR4 &b) -> float { 
     D3DXVECTOR4 d = a - b; return D3DXVec4Length(&d);
   };
+
+  if (g_optimize_spline) {
+
+  } else {
+
+  }
 
   // simplify the keyframes
   auto pos_frames = remove_keyframes<D3DXVECTOR3>(pos, vec3_dist);
@@ -941,7 +889,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   if (polys_by_material.size() > 1)
     add_verbose("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
 
-  mesh->obj_to_world = max_to_dx(fbx_node->EvaluateGlobalTransform());
+  extract_prs(fbx_node->EvaluateGlobalTransform(), &mesh->pos, &mesh->rot, &mesh->scale);
 
   vector<D3DXVECTOR3> verts;
   verts.reserve(fbx_mesh->GetPolygonVertexCount());
@@ -1019,7 +967,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       }
     }
 
-    if (g_optimzed_mesh) {
+    if (g_optimize_mesh) {
       vector<int> optimized_indices;
       vector<int> vertex_reorder;
       VertexOptimizer opt(sub_mesh->pos.size());
@@ -1056,10 +1004,10 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   // calc center and extents
   compute_extents(verts, &mesh->center, &mesh->extents);
 
-  _scene.meshes.push_back(unique_ptr<Mesh>(mesh));
-
-  if (!process_animation(fbx_node, false))
+  if (!process_animation(fbx_node, false, &mesh->is_static))
     return false;
+
+  _scene.meshes.push_back(unique_ptr<Mesh>(mesh));
 
   return true;
 }
@@ -1291,7 +1239,6 @@ bool FbxConverter::save_animations() {
 
     if (!anim.pos.empty() || !anim.rot.empty() || !anim.scale.empty()) {
       _writer->add_deferred_string(name);
-      add_verbose("anim: %s", name.c_str());
       save_animations(anim.pos);
       save_animations(anim.rot);
       save_animations(anim.scale);
@@ -1322,6 +1269,7 @@ bool FbxConverter::save_cameras() {
     _writer->write((float)camera->fov_y);
     _writer->write((float)camera->near_plane);
     _writer->write((float)camera->far_plane);
+    _writer->write(camera->is_static);
   };
 
   return true;
@@ -1345,6 +1293,7 @@ bool FbxConverter::save_lights() {
     _writer->write(light->use_far_attenuation);
     _writer->write((float)light->far_attenuation_start);
     _writer->write((float)light->far_attenuation_end);
+    _writer->write(light->is_static);
   }
 
   return true;
@@ -1363,9 +1312,12 @@ bool FbxConverter::save_meshes() {
 
     auto &mesh = meshes[i];
     _writer->add_deferred_string(mesh->name);
-    _writer->write(mesh->obj_to_world);
+    _writer->write(mesh->pos);
+    _writer->write(mesh->rot);
+    _writer->write(mesh->scale);
     _writer->write(mesh->center);
     _writer->write(mesh->extents);
+    _writer->write(mesh->is_static);
 
     _writer->write((int)mesh->sub_meshes.size());
     for (size_t j = 0; j < mesh->sub_meshes.size(); ++j) {
@@ -1607,17 +1559,33 @@ int parse_cmd_line(LPSTR lpCmdLine) {
   int argc = (int)tokens.size();
 
   if (argc < 2) {
-    printf("syntax: %s [--verbose] [--watch] src dst", module_name);
+    printf("syntax: %s [--verbose] [--watch] [--no-anim] [--no-opt] [--pos-bits NN] [--normal-bits NN] [--tex-bits NN] [--anim-bits NN] src dst", module_name);
     return 1;
   }
 
-  for (int i = 0; i < argc - 2; ++i) {
+  int num_args = argc - 2;
+  for (int i = 0; i < num_args; ++i) {
     g_verbose     |= tokens[i] == "--verbose";
     g_file_watch  |= tokens[i] == "--watch";
+
     if (tokens[i] == "--no-anim")
       g_export_animation = false;
+
     if (tokens[i] == "--no-opt")
-      g_optimzed_mesh = false;
+      g_optimize_mesh = false;
+
+    if (tokens[i] == "--pos-bits" && i != num_args - 1)
+      g_position_bits = atoi(tokens[++i].c_str());
+
+    if (tokens[i] == "--normal-bits" && i != num_args - 1)
+      g_normal_bits = atoi(tokens[++i].c_str());
+
+    if (tokens[i] == "--tex-bits" && i != num_args - 1)
+      g_texcoord_bits = atoi(tokens[++i].c_str());
+
+    if (tokens[i] == "--anim-bits" && i != num_args - 1)
+      g_animation_bits = atoi(tokens[++i].c_str());
+
   }
 
   g_src = tokens[argc-2].c_str();
@@ -1788,8 +1756,164 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   return DefWindowProc(hwnd, msg, wparam, lparam);
 }
 
+void extract(float *baked, float t, float *extracted) {
+  float t2 = t*t;
+  float t3 = t2*t;
+  extracted[0] = 6 * baked[0] / (1-3*t+3*t2+t3);
+  extracted[1] = 6 * baked[1] / (4-6*t2+3*t3);
+  extracted[2] = 6 * baked[2] / (1+3*t+3*t2-3*t3);
+  extracted[3] = t3 > 0 ? 6 * baked[3] / t3 : 0;
+}
+
+typedef double Real;
+int mQuantity = 20;
+int mDegree = 3;
+
+Real mValue[4];
+Real mKnot[6];
+
+// Stolen from Wm5BSplineFitBasis
+void compute_factors(float t, int& imin, int& imax) {
+
+  // Use scaled time and scaled knots so that 1/(Q-D) does not need to
+  // be explicitly stored by the class object.  Determine the extreme
+  // indices affected by local control.
+  Real QmD = (Real)(mQuantity - mDegree);
+  Real tValue;
+  if (t <= (Real)0)
+  {
+    tValue = (Real)0;
+    imin = 0;
+    imax = mDegree;
+  }
+  else if (t >= (Real)1)
+  {
+    tValue = QmD;
+    imax = mQuantity - 1;
+    imin = imax - mDegree;
+  }
+  else
+  {
+    tValue = QmD*t;
+    imin = (int)tValue;
+    imax = imin + mDegree;
+  }
+
+  // Precompute the knots.
+  for (int i0 = 0, i1 = imax+1-mDegree; i0 < 2*mDegree; ++i0, ++i1)
+  {
+    if (i1 <= mDegree)
+    {
+      mKnot[i0] = (Real)0;
+    }
+    else if (i1 >= mQuantity)
+    {
+      mKnot[i0] = QmD;
+    }
+    else
+    {
+      mKnot[i0] = (Real)(i1 - mDegree);
+    }
+  }
+
+  // Initialize the basis function evaluation table.  The first degree-1
+  // entries are zero, but they do not have to be set explicitly.
+  mValue[mDegree] = (Real)1;
+
+  // Update the basis function evaluation table, each iteration overwriting
+  // the results from the previous iteration.
+  for (int row = mDegree-1; row >= 0; --row)
+  {
+    int k0 = mDegree, k1 = row;
+    Real knot0 = mKnot[k0], knot1 = mKnot[k1];
+    Real invDenom = ((Real)1)/(knot0 - knot1);
+    Real c1 = (knot0 - tValue)*invDenom, c0;
+    mValue[row] = c1*mValue[row + 1];
+
+    for (int col = row + 1; col < mDegree; ++col)
+    {
+      c0 = (tValue - knot1)*invDenom;
+      mValue[col] *= c0;
+
+      knot0 = mKnot[++k0];
+      knot1 = mKnot[++k1];
+      invDenom = ((Real)1)/(knot0 - knot1);
+      c1 = (knot0 - tValue)*invDenom;
+      mValue[col] += c1*mValue[col + 1];
+    }
+
+    c0 = (tValue - knot1)*invDenom;
+    mValue[mDegree] *= c0;
+  }
+}
+
+
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
+
+  using namespace Wm5;
+  Memory::Initialize();
+/*
+  vector<double> ff;
+  for (int i = 0; i < 100; ++i) {
+    ff.push_back(10 * cosf(2*3.1415f*i/100.0f));
+  }
+
+  spline_fit(1, 100, ff.data(), 0.0001);
+
+
+  BSplineCurveFit<double> fitter(1, 100, ff.data(), 3, 5);
+  vector<double> xx;
+  for (int i = 0; i < 100; ++i) {
+    double v;
+    fitter.GetPosition(i/100.0f, &v);
+    xx.push_back(v);
+  }
+
+  int deg = fitter.GetDegree();
+  int control_quant = fitter.GetControlQuantity();
+  const double *control_data = fitter.GetControlData();
+  BSplineFitBasis<double> basis = fitter.GetBasis();
+
+  double t = 0.1;
+  double t2 = t*t;
+  double t3 = t*t2;
+
+  double v2;
+  fitter.GetPosition(t, &v2);
+
+  int imin, imax;
+
+  int i0, i1;
+  compute_factors(t, i0, i1);
+
+  basis.Compute(t, imin, imax);
+  double pp[4];
+  for (int i = 0; i <= imax - imin; ++i)
+    pp[i] = basis.GetValue(i);
+
+  double s = 1/6.0f;
+  double c[4] = {
+    s * (1 -3*t +3*t2 +1*t3),
+    s * (4      -6*t2 +3*t3),
+    s * (1 +3*t +3*t2 -3*t3),
+    s * (              1*t3)
+  };
+  double vx = 0;
+  for (int i = 0; i<= i1-i0; ++i)
+    vx += mValue[i] * control_data[i0+i];
+
+  double v = 0;
+  for (int i = 0; i <= imax - imin; ++i)
+    v += pp[i] * control_data[imin+i];
+
+  double d[4] = {
+    pp[0] - c[0],
+    pp[1] - c[1],
+    pp[2] - c[2],
+    pp[3] - c[3],
+  };
+*/
 
   AllocConsole();
   freopen("CONOUT$","wb",stdout);
@@ -1860,6 +1984,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   }
 
   FreeConsole();
+
+  Memory::Terminate("fbx_conv_memory.log");
 
   return msg.wParam;
 }
