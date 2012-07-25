@@ -715,6 +715,15 @@ FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex)
   return lPoseMatrix;
 }
 
+template<class T>
+bool is_static_animation(const vector<T> &org, const function<float(const T& a, const T& b)> &distance) {
+  for (size_t i = 0; i < org.size() - 1; ++i) {
+    if (distance(org[i], org[i+1]) > 0.001f)
+      return false;
+  }
+  return true;
+}
+
 template <class T>
 vector<int> remove_keyframes(const vector<T> &org, const function<float(const T& a, const T& b)> &distance) {
 
@@ -748,6 +757,107 @@ vector<int> remove_keyframes(const vector<T> &org, const function<float(const T&
   return res;
 }
 
+int sign(float a) {
+  return a < 0 ? -1 : a > 0 ? 1 : 0;
+}
+
+template <typename T>
+struct SamplePoint {
+  SamplePoint(float t, const T &value) : t(t), value(value) {}
+  float t;
+  T value;
+};
+
+template <typename T>
+struct Segment {
+  Segment(const SamplePoint<T> &p0, const SamplePoint<T> &p1, int start, int end) : p0(p0), p1(p1), sample_start(start), sample_end(end), err(0) {}
+  SamplePoint<T> p0, p1;
+  int sample_start, sample_end; // [sample_start, sample_end)
+  double err;
+};
+
+template <typename T>
+T sample_point(float t, const Segment<T> &segment) {
+  auto &a = segment.p0;
+  auto &b = segment.p1;
+  float f = (t - a.t) / (b.t - a.t);
+  return a.value + f * (b.value - a.value);
+}
+
+float length_sq(const D3DXVECTOR3 &v) {
+  return D3DXVec3LengthSq(&v);
+}
+
+float length_sq(const D3DXVECTOR4 &v) {
+  return D3DXVec4LengthSq(&v);
+}
+
+template <typename T>
+double calc_error(const vector<SamplePoint<T>> &points, const Segment<T> &segment) {
+
+  double err = 0;
+  for (int i = segment.sample_start; i < segment.sample_end; ++i) {
+    T pt = sample_point(points[i].t, segment);
+    err += length_sq(pt - points[i].value);
+  }
+  return err / (segment.sample_end - segment.sample_start);
+}
+
+template <typename T>
+deque<Segment<T>> linear_fit(const vector<SamplePoint<T>> &points, double threshold) {
+
+  typedef Segment<T> SegT;
+
+  // add a single line segment
+  deque<SegT> segments;
+  segments.push_back(SegT(points.front(), points.back(), 0, points.size() - 1));
+  segments.back().err = calc_error(points, segments.back());
+
+  deque<SegT> done_segments;
+
+  while (!segments.empty()) {
+    double total_err = 0;
+    for (size_t i = 0; i < segments.size(); ++i)
+      total_err += segments[i].err;
+
+    if (total_err < threshold)
+      break;
+
+    // sort segments by error
+    sort(RANGE(segments), [&](const SegT &a, const SegT &b) { return a.err > b.err; });
+
+    // split the segment with the largest error into 2
+    auto largest_err = segments.front();
+    segments.pop_front();
+
+    int s = largest_err.sample_start;
+    int e = largest_err.sample_end;
+    int middle = (s + e) / 2;
+    SegT s0(points[s], points[middle], s, middle);
+    SegT s1(points[middle], points[e], middle, e);
+
+    s0.err = calc_error(points, s0);
+    s1.err = calc_error(points, s1);
+
+    if (middle - s <= 1) {
+      done_segments.push_back(s0);
+    } else {
+      segments.push_back(s0);
+    }
+
+    if (e - middle <= 1) {
+      done_segments.push_back(s1);
+    } else {
+      segments.push_back(s1);
+    }
+  }
+
+  copy(RANGE(done_segments), back_inserter(segments));
+  sort(RANGE(segments), [&](const SegT &a, const SegT &b) { return a.sample_start < b.sample_start; });
+
+  return segments;
+}
+
 bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool *is_static) {
   INFO_SCOPE;
 
@@ -757,80 +867,166 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool 
   }
 
   FbxAMatrix a = GetGeometry(node);
-  auto &anim = _animation[node->GetName()];
-
-  if (!g_export_animation) {
-    FbxTime cur;
-    cur.SetSecondDouble(0);
-    FbxAMatrix m;
-    m = GetGlobalPosition(node, cur) * a;
-    anim.pos.emplace_back(KeyFrameVec3(0, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
-    if (!translation_only) {
-      anim.rot.emplace_back(KeyFrameVec4(0, max_to_dx(m.GetQ(), true)));
-      anim.scale.emplace_back(KeyFrameVec3(0, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
-    }
-    return true;
-  }
 
   vector<D3DXVECTOR3> pos;
   vector<D3DXVECTOR4> rot;
   vector<D3DXVECTOR3> scale;
-  map<double, FbxAMatrix> anim_cache;
+
+  vector<SamplePoint<D3DXVECTOR3>> pos_samples;
+  vector<SamplePoint<D3DXVECTOR4>> rot_samples;
+  vector<SamplePoint<D3DXVECTOR3>> scale_samples;
 
   int num_frames = (int)(_duration_ms * _fps / 1000 + 0.5f);
+  D3DXQUATERNION prev_rotation;
   for (int i = 0; i <= num_frames; ++i) {
     FbxTime cur;
     double cur_time = i*_duration/num_frames;
     cur.SetSecondDouble(cur_time);
-    FbxAMatrix m;
-    m = GetGlobalPosition(node, cur) * a;
-    anim_cache[cur_time] = m;
-    pos.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT())));
-    rot.emplace_back(max_to_dx(m.GetQ(), true));
-    scale.emplace_back(drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS())));
+    FbxAMatrix m = GetGlobalPosition(node, cur) * a;
+    D3DXVECTOR3 p = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()));
+    float t= (float)cur_time;
+    pos_samples.push_back(SamplePoint<D3DXVECTOR3>(t, p));
+    pos.emplace_back(p);
+    D3DXVECTOR4 r = max_to_dx(m.GetQ(), true);
+    D3DXQUATERNION q(r.x, r.y, r.z, r.w);
+    D3DXQuaternionNormalize(&q, &q);
+    if (i > 0) {
+      // flip the quat if it isn't in the same quadrant as the previous one
+      if (D3DXQuaternionDot(&q, &prev_rotation) < 0) {
+        q = -q;
+      }
+    }
+    prev_rotation = q;
+    r = D3DXVECTOR4(q.x, q.y, q.z, q.w);
+    rot_samples.push_back(SamplePoint<D3DXVECTOR4>(t, r));
+    rot.emplace_back(r);
+
+    D3DXVECTOR3 s = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()));
+    scale_samples.push_back(SamplePoint<D3DXVECTOR3>(t,s));
+    scale.emplace_back(s);
   }
 
   auto vec3_dist = [&](const D3DXVECTOR3 &a, const D3DXVECTOR3 &b) -> float { 
-    D3DXVECTOR3 d = a - b; return D3DXVec3Length(&d);
+    return D3DXVec3Length(&(a-b));
   };
 
   auto vec4_dist = [&](const D3DXVECTOR4 &a, const D3DXVECTOR4 &b) -> float { 
-    D3DXVECTOR4 d = a - b; return D3DXVec4Length(&d);
+    return D3DXVec4Length(&(a-b));
   };
+
+
+  D3DXVECTOR3 vel[2];
+  vel[0] = pos[1] - pos[0];
+  vel[1] = pos[2] - pos[1];
+
+  bool vel_change = false;
+  bool acc_change = false;
+  D3DXVECTOR3 prev_acc = vel[1] - vel[0];
+  D3DXVECTOR3 prev_vel = pos[1] - pos[0];
+  for (size_t i = 2; i < pos.size(); ++i) {
+    D3DXVECTOR3 cur_vel = pos[i] - pos[i-1];
+    D3DXVECTOR3 cur_acc = cur_vel - vel[1];
+
+    for (int j = 0; j < 3; ++j) {
+      int s0 = sign(cur_vel[j]);
+      int s1 = sign(prev_vel[j]);
+      if (s0 > 0 && s1 < 0 || s0 < 0 && s1 > 0)
+        vel_change = true;
+    }
+
+    prev_acc = cur_acc;
+    prev_vel = cur_vel;
+
+    vel[0] = vel[1];
+    vel[1] = cur_vel;
+  }
+  if (vel_change)
+    add_verbose("change in vel for %s", node->GetName());
+
+  bool static_pos = is_static_animation<D3DXVECTOR3>(pos, vec3_dist);
+  bool static_rot = is_static_animation<D3DXVECTOR4>(rot, vec4_dist);
+  bool static_scale = is_static_animation<D3DXVECTOR3>(scale, vec3_dist);
+
+  if (static_pos && (translation_only || (static_rot && static_scale))) {
+    *is_static = true;
+    return true;
+  }
+
+  auto pos_segments = linear_fit(pos_samples, 10);
+  auto scale_segments = linear_fit(scale_samples, 1);
+  auto rot_segments = linear_fit(rot_samples, 0.01);
+
+  *is_static = false;
+
+  Animation &anim = _animation[node->GetName()];
 
   if (g_optimize_spline) {
 
   } else {
 
+/*
+    if (!static_pos) {
+      Wm5::BSplineCurveFit<float> fitter(3, pos.size(), (float *)pos.data(), 3, g_num_control_points);
+      anim.pos_control_points.resize(g_num_control_points);
+      memcpy(anim.pos_control_points.data(), fitter.GetControlData(), g_num_control_points * sizeof(D3DXVECTOR3));
+    }
+
+    if (!static_rot) {
+      Wm5::BSplineCurveFit<float> fitter(4, rot.size(), (float *)rot.data(), 3, g_num_control_points);
+      anim.rot_control_points.resize(g_num_control_points);
+      memcpy(anim.rot_control_points.data(), fitter.GetControlData(), g_num_control_points * sizeof(D3DXVECTOR4));
+    }
+
+    if (!static_scale) {
+      Wm5::BSplineCurveFit<float> fitter(3, scale.size(), (float *)scale.data(), 3, g_num_control_points);
+      anim.scale_control_points.resize(g_num_control_points);
+      memcpy(anim.scale_control_points.data(), fitter.GetControlData(), g_num_control_points * sizeof(D3DXVECTOR3));
+    }
+*/
+    if (!static_pos) {
+      for (size_t i = 0; i < pos_segments.size(); ++i) {
+        anim.pos.push_back(KeyFrameVec3(pos_segments[i].p0.t, pos_segments[i].p0.value));
+      }
+    }
+
+    if (!static_rot) {
+      for (size_t i = 0; i < rot_segments.size(); ++i) {
+        anim.rot.push_back(KeyFrameVec4(rot_segments[i].p0.t, rot_segments[i].p0.value));
+      }
+    }
+
+    if (!static_scale) {
+      for (size_t i = 0; i < scale_segments.size(); ++i) {
+        anim.scale.push_back(KeyFrameVec3(scale_segments[i].p0.t, scale_segments[i].p0.value));
+      }
+    }
+
+
   }
-
-  // simplify the keyframes
-  auto pos_frames = remove_keyframes<D3DXVECTOR3>(pos, vec3_dist);
-  auto rot_frames = remove_keyframes<D3DXVECTOR4>(rot, vec4_dist);
-  auto scale_frames = remove_keyframes<D3DXVECTOR3>(scale, vec3_dist);
-
+/*
+  add_verbose("%s - %d pos frames, %d rot frames, %d scale frames", node->GetName(), 
+    static_pos ? 0 : pos.size(),
+    static_rot ? 0 : rot.size(),
+    static_scale ? 0 : scale.size());
+*/
+/*
   FbxTime cur;
   FbxAMatrix m;
-  for (size_t i = 0; i < pos_frames.size(); ++i) {
-    double cur_time = pos_frames[i]*_duration/num_frames;
+  for (size_t i = 0; i < pos.size(); ++i) {
+    double cur_time = i*_duration/num_frames;
     m = anim_cache[cur_time];
-    anim.pos.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
-  }
+    if (!static_pos)
+      anim.pos.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetT()))));
 
-  if (!translation_only) {
-    for (size_t i = 0; i < rot_frames.size(); ++i) {
-      double cur_time = rot_frames[i]*_duration/num_frames;
-      m = anim_cache[cur_time];
-      anim.rot.emplace_back(KeyFrameVec4(cur_time, max_to_dx(m.GetQ(), true)));
-    }
+    if (!translation_only) {
+      if (!static_rot)
+        anim.rot.emplace_back(KeyFrameVec4(cur_time, max_to_dx(m.GetQ(), true)));
 
-    for (size_t i = 0; i < scale_frames.size(); ++i) {
-      double cur_time = scale_frames[i]*_duration/num_frames;
-      m = anim_cache[cur_time];
-      anim.scale.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
+      if (!static_scale)
+        anim.scale.emplace_back(KeyFrameVec3(cur_time, drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(m.GetS()))));
     }
   }
-
+*/
   return true;
 }
 
@@ -1145,6 +1341,24 @@ void prune_animations(map<string, vector<KeyFrame<T>>> *anims) {
   }
 }
 
+bool FbxConverter::save_animations2(const std::vector<KeyFrameVec3> &frames) {
+  _writer->write((int)frames.size());
+  for (size_t i = 0; i < frames.size(); ++i) {
+    _writer->write((float)frames[i].time);
+    _writer->write(frames[i].value);
+  }
+  return true;
+}
+
+bool FbxConverter::save_animations2(const std::vector<KeyFrameVec4> &frames) {
+  _writer->write((int)frames.size());
+  for (size_t i = 0; i < frames.size(); ++i) {
+    _writer->write((float)frames[i].time);
+    _writer->write(frames[i].value);
+  }
+  return true;
+}
+
 bool FbxConverter::save_animations(const vector<KeyFrameVec3> &frames) {
 
   BitWriter writer;
@@ -1239,9 +1453,30 @@ bool FbxConverter::save_animations() {
 
     if (!anim.pos.empty() || !anim.rot.empty() || !anim.scale.empty()) {
       _writer->add_deferred_string(name);
-      save_animations(anim.pos);
-      save_animations(anim.rot);
-      save_animations(anim.scale);
+/*
+      // pos
+      int num_pts = (int)anim.pos_control_points.size();
+      _writer->write(num_pts);
+      if (num_pts)
+        _writer->write_raw(anim.pos_control_points.data(), num_pts * sizeof(D3DXVECTOR3));
+
+      // rot
+      num_pts = (int)anim.rot_control_points.size();
+      _writer->write(num_pts);
+      if (num_pts > 0)
+        _writer->write_raw(anim.rot_control_points.data(), num_pts * sizeof(D3DXVECTOR4));
+
+      // scale
+      num_pts = (int)anim.scale_control_points.size();
+      _writer->write(num_pts);
+      if (num_pts > 0)
+        _writer->write_raw(anim.scale_control_points.data(), num_pts * sizeof(D3DXVECTOR3));
+*/
+
+      save_animations2(anim.pos);
+      save_animations2(anim.rot);
+      save_animations2(anim.scale);
+
     }
   }
 

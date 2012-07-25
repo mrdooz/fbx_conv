@@ -265,6 +265,8 @@ private:
 
   bool save_animations(const std::vector<KeyFrameVec3> &frames);
   bool save_animations(const std::vector<KeyFrameVec4> &frames);
+  bool save_animations2(const std::vector<KeyFrameVec3> &frames);
+  bool save_animations2(const std::vector<KeyFrameVec4> &frames);
   bool save_animations();
   bool save_lights();
   bool save_materials();
@@ -327,6 +329,10 @@ private:
     std::vector<KeyFrameVec3> pos;
     std::vector<KeyFrameVec4> rot;
     std::vector<KeyFrameVec3> scale;
+
+    std::vector<D3DXVECTOR3> pos_control_points;
+    std::vector<D3DXVECTOR4> rot_control_points;
+    std::vector<D3DXVECTOR3> scale_control_points;
   };
 
   std::map<std::string, Animation> _animation;
