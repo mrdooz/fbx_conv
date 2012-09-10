@@ -914,7 +914,6 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool 
     return D3DXVec4Length(&(a-b));
   };
 
-
   D3DXVECTOR3 vel[2];
   vel[0] = pos[1] - pos[0];
   vel[1] = pos[2] - pos[1];
@@ -952,8 +951,8 @@ bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool 
     return true;
   }
 
-  auto pos_segments = linear_fit(pos_samples, 10);
-  auto scale_segments = linear_fit(scale_samples, 1);
+  auto pos_segments = linear_fit(pos_samples, 1);
+  auto scale_segments = linear_fit(scale_samples, 0.1);
   auto rot_segments = linear_fit(rot_samples, 0.01);
 
   *is_static = false;
@@ -1082,10 +1081,26 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
   Mesh *mesh = new Mesh(fbx_node->GetName());
 
+  bool isStatic;
+  if (!process_animation(fbx_node, false, &isStatic))
+    return false;
+
+  mesh->is_static = isStatic;
+
+  FbxAMatrix mtxTransform = fbx_node->EvaluateGlobalTransform();
+  FbxAMatrix mtxTransformNormal(mtxTransform);
+  mtxTransformNormal.SetT(FbxVector4(0,0,0,1));
+
+  extract_prs(mtxTransform, &mesh->pos, &mesh->rot, &mesh->scale);
+
+  // If the object is static, then apply the rotational part of its transform
+  // but leave the translation alone
+  if (isStatic) {
+    mesh->rot = D3DXVECTOR4(0,0,0,1);
+  }
+
   if (polys_by_material.size() > 1)
     add_verbose("%Iu submesh%s", polys_by_material.size(), polys_by_material.size() == 1 ? "" : "es");
-
-  extract_prs(fbx_node->EvaluateGlobalTransform(), &mesh->pos, &mesh->rot, &mesh->scale);
 
   vector<D3DXVECTOR3> verts;
   verts.reserve(fbx_mesh->GetPolygonVertexCount());
@@ -1128,14 +1143,22 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
       // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
-        auto pos = max_to_dx(fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k)));
-        auto pos3 = drop<D3DXVECTOR4, D3DXVECTOR3>(pos);
-        verts.push_back(pos3);
-        FbxVector4 normal2;
-        fbx_mesh->GetPolygonVertexNormal(poly_idx, k, normal2);
-        auto normal = max_to_dx(normal2);
 
-        SuperVertex cand(drop<D3DXVECTOR4, D3DXVECTOR3>(pos), drop<D3DXVECTOR4, D3DXVECTOR3>(normal));
+        auto fbxPos = fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k));
+        FbxVector4 fbxNormal;
+        fbx_mesh->GetPolygonVertexNormal(poly_idx, k, fbxNormal);
+
+        // if the mesh is static, rotate it
+        if (isStatic) {
+          fbxPos = mtxTransformNormal.MultT(fbxPos);
+          fbxNormal = mtxTransformNormal.MultT(fbxNormal);
+        }
+
+        auto pos3 = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxPos));
+        verts.push_back(pos3);
+        auto normal3 = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxNormal));
+
+        SuperVertex cand(pos3, normal3);
         for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
           FbxVector2 uv;
           fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
@@ -1151,7 +1174,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         if (it == super_verts.end()) {
           idx = cand.idx = sub_mesh->pos.size();
           sub_mesh->pos.push_back(pos3);
-          sub_mesh->normal.push_back(drop<D3DXVECTOR4, D3DXVECTOR3>(normal));
+          sub_mesh->normal.push_back(normal3);
           if (vertex_flags & SubMesh::kTex0) sub_mesh->tex0.push_back(cand.uv[0]);
           if (vertex_flags & SubMesh::kTex1) sub_mesh->tex1.push_back(cand.uv[1]);
           super_verts.insert(cand);
@@ -1194,14 +1217,26 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
 
       sub_mesh->indices = optimized_indices;
     }
-
   }
 
   // calc center and extents
   compute_extents(verts, &mesh->center, &mesh->extents);
 
-  if (!process_animation(fbx_node, false, &mesh->is_static))
-    return false;
+  // If the mesh is static, move the vertices so the center of the AABB is at (0,0,0), and
+  // apply that translation to the obj->world matrix
+  if (isStatic) {
+    D3DXVECTOR3 ofs(mesh->center);
+    for (size_t i = 0; i < mesh->sub_meshes.size(); ++i) {
+      SubMesh *submesh = mesh->sub_meshes[i].get();
+      vector<D3DXVECTOR3> &verts = submesh->pos;
+      size_t numVerts = verts.size();
+      for (size_t j = 0; j < numVerts; ++j) {
+        verts[j] -= ofs;
+      }
+    }
+    mesh->pos += mesh->center;
+    mesh->center = D3DXVECTOR3(0,0,0);
+  }
 
   _scene.meshes.push_back(unique_ptr<Mesh>(mesh));
 
@@ -2088,67 +2123,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
   using namespace Wm5;
   Memory::Initialize();
-/*
-  vector<double> ff;
-  for (int i = 0; i < 100; ++i) {
-    ff.push_back(10 * cosf(2*3.1415f*i/100.0f));
-  }
-
-  spline_fit(1, 100, ff.data(), 0.0001);
-
-
-  BSplineCurveFit<double> fitter(1, 100, ff.data(), 3, 5);
-  vector<double> xx;
-  for (int i = 0; i < 100; ++i) {
-    double v;
-    fitter.GetPosition(i/100.0f, &v);
-    xx.push_back(v);
-  }
-
-  int deg = fitter.GetDegree();
-  int control_quant = fitter.GetControlQuantity();
-  const double *control_data = fitter.GetControlData();
-  BSplineFitBasis<double> basis = fitter.GetBasis();
-
-  double t = 0.1;
-  double t2 = t*t;
-  double t3 = t*t2;
-
-  double v2;
-  fitter.GetPosition(t, &v2);
-
-  int imin, imax;
-
-  int i0, i1;
-  compute_factors(t, i0, i1);
-
-  basis.Compute(t, imin, imax);
-  double pp[4];
-  for (int i = 0; i <= imax - imin; ++i)
-    pp[i] = basis.GetValue(i);
-
-  double s = 1/6.0f;
-  double c[4] = {
-    s * (1 -3*t +3*t2 +1*t3),
-    s * (4      -6*t2 +3*t3),
-    s * (1 +3*t +3*t2 -3*t3),
-    s * (              1*t3)
-  };
-  double vx = 0;
-  for (int i = 0; i<= i1-i0; ++i)
-    vx += mValue[i] * control_data[i0+i];
-
-  double v = 0;
-  for (int i = 0; i <= imax - imin; ++i)
-    v += pp[i] * control_data[imin+i];
-
-  double d[4] = {
-    pp[0] - c[0],
-    pp[1] - c[1],
-    pp[2] - c[2],
-    pp[3] - c[3],
-  };
-*/
 
   AllocConsole();
   freopen("CONOUT$","wb",stdout);

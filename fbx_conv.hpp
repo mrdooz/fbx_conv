@@ -146,6 +146,7 @@ struct SubMesh {
   std::vector<D3DXVECTOR2> tex0;
   std::vector<D3DXVECTOR2> tex1;
   std::vector<int> indices;
+
 };
 
 struct Mesh {
