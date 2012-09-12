@@ -83,37 +83,29 @@ struct Material {
   std::vector<MaterialProperty> properties;
 };
 
-struct SuperVertex {
-  SuperVertex(const D3DXVECTOR3 &pos, const D3DXVECTOR3 &normal) : pos(pos), normal(normal), idx(-1) {}
+struct VertexElement {
+  VertexElement() {}
+  VertexElement(const D3DXVECTOR3 &pos, const D3DXVECTOR3 &normal) : pos(pos), normal(normal), tex0(0,0), tex1(0,0), idx(-1) {}
   D3DXVECTOR3 pos;
   D3DXVECTOR3 normal;
-  std::vector<D3DXVECTOR2> uv;
+  D3DXVECTOR3 tangent;
+  D3DXVECTOR3 binormal;
+  D3DXVECTOR2 tex0;
+  D3DXVECTOR2 tex1;
   int idx;
 
-  friend bool operator<(const SuperVertex &a, const SuperVertex &b) {
+  friend bool operator<(const VertexElement &a, const VertexElement &b) {
     // strict weak ordering
-    for (int i = 0; i < 3; ++i) {
-      if (a.pos[i] < b.pos[i]) 
-        return true;
-      if (b.pos[i] < a.pos[i])
-        return false;
-    }
+#define CMP(value, size)                    \
+  for (int i = 0; i < 3; ++i) {             \
+    if (a.value[i] < b.value[i]) return true;   \
+    if (b.value[i] < a.value[i]) return false;  \
+  }
+    CMP(pos, 3);
+    CMP(normal, 3);
+    CMP(tex0, 2);
+    CMP(tex1, 2);
 
-    for (int i = 0; i < 3; ++i) {
-      if (a.normal[i] < b.normal[i])
-        return true;
-      if (b.normal[i] < a.normal[i])
-        return false;
-    }
-
-    for (size_t i = 0; i < a.uv.size(); ++i) {
-      for (int j = 0; j < 2; ++j) {
-        if (a.uv[i][j] < b.uv[i][j])
-          return true;
-        if (b.uv[i][j] < a.uv[i][j])
-          return false;
-      }
-    }
     return false;
   }
 };
@@ -122,10 +114,11 @@ struct Mesh;
 struct SubMesh {
 
   enum VertexFlags {
-    kPos     = 1 << 0,
-    kNormal  = 1 << 1,
-    kTex0    = 1 << 2,
-    kTex1    = 1 << 3,
+    kPos            = 1 << 0,
+    kNormal         = 1 << 1,
+    kTex0           = 1 << 2,
+    kTex1           = 1 << 3,
+    kTangentSpace   = 1 << 4,
   };
 
   SubMesh(Mesh *mesh, const std::string &name, const std::string &material, uint32 vertex_flags) 
@@ -135,16 +128,16 @@ struct SubMesh {
     element_size += vertex_flags & kNormal ? sizeof(D3DXVECTOR3) : 0;
     element_size += vertex_flags & kTex0 ? sizeof(D3DXVECTOR2) : 0;
     element_size += vertex_flags & kTex1 ? sizeof(D3DXVECTOR2) : 0;
+    element_size += vertex_flags & kTangentSpace ? 2 * sizeof(D3DXVECTOR3) : 0;
   }
+
   Mesh *mesh;
   std::string name;
   std::string material;
   uint32 vertex_flags;
   uint32 element_size;
-  std::vector<D3DXVECTOR3> pos;
-  std::vector<D3DXVECTOR3> normal;
-  std::vector<D3DXVECTOR2> tex0;
-  std::vector<D3DXVECTOR2> tex1;
+
+  std::vector<VertexElement> vertices;
   std::vector<int> indices;
 
 };
@@ -244,7 +237,6 @@ extern FbxConverter *g_converter;
 class FbxConverter {
 public:
   FbxConverter();
-  ~FbxConverter();
   bool convert(const char *src, const char *dst);
 private:
 

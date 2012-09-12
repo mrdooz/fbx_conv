@@ -164,3 +164,5 @@ T max4(const T &a, const T &b, const T &c, const T &d) {
   return max(a, max3(b, c, d));
 }
 
+
+std::string to_string(const char *format, ...);

@@ -6,6 +6,8 @@
 #include "utils.hpp"
 #include "bitutils.hpp"
 #include "optimize.hpp"
+#include "support.hpp"
+#include <direct.h>
 
 using namespace std;
 using namespace stdext;
@@ -27,6 +29,7 @@ bool g_file_watch;
 FbxConverter *g_converter;
 string g_src_path;
 string g_src, g_dst;
+string g_inputDir, g_outputDir;
 HWND g_hwnd;
 HANDLE g_dir;
 HANDLE g_quit_event;
@@ -57,7 +60,7 @@ static int num_bits(int a) {
   return res;
 }
 
-uint32 quantize(float value, int num_bits) {
+static uint32 quantize(float value, int num_bits) {
   // assume value is in the [-1..1] range
   uint32 scale = (1 << (num_bits-1)) - 1;
   uint32 v = (uint32)(scale * fabs(value));
@@ -66,7 +69,7 @@ uint32 quantize(float value, int num_bits) {
   return v;
 }
 
-void compute_extents(const std::vector<D3DXVECTOR3> &verts, D3DXVECTOR3 *center, D3DXVECTOR3 *extents) {
+static void compute_extents(const std::vector<D3DXVECTOR3> &verts, D3DXVECTOR3 *center, D3DXVECTOR3 *extents) {
   D3DXVECTOR3 min_value, max_value;
   min_value = max_value = verts[0];
   for (size_t i = 1; i < verts.size(); ++i) {
@@ -79,7 +82,7 @@ void compute_extents(const std::vector<D3DXVECTOR3> &verts, D3DXVECTOR3 *center,
   *extents = max_value - *center;
 }
 
-void compute_extents(const std::vector<D3DXVECTOR4> &verts, D3DXVECTOR4 *center, D3DXVECTOR4 *extents) {
+static void compute_extents(const std::vector<D3DXVECTOR4> &verts, D3DXVECTOR4 *center, D3DXVECTOR4 *extents) {
   D3DXVECTOR4 min_value, max_value;
   min_value = max_value = verts[0];
   for (size_t i = 1; i < verts.size(); ++i) {
@@ -93,19 +96,19 @@ void compute_extents(const std::vector<D3DXVECTOR4> &verts, D3DXVECTOR4 *center,
 }
 
 
-D3DXVECTOR4 max_to_dx(const FbxDouble4 &m, bool neg_w) {
+static D3DXVECTOR4 max_to_dx(const FbxDouble4 &m, bool neg_w) {
   return D3DXVECTOR4((float)m[0], (float)m[2], (float)m[1], (neg_w ? -1 : 1) * (float)m[3]);
 }
 
-D3DXVECTOR4 max_to_dx(const FbxDouble4 &m) {
+static D3DXVECTOR4 max_to_dx(const FbxDouble4 &m) {
   return D3DXVECTOR4((float)m[0], (float)m[2], (float)m[1], (float)m[3]);
 }
 
-D3DXVECTOR3 max_to_dx(const FbxDouble3 &m) {
+static D3DXVECTOR3 max_to_dx(const FbxDouble3 &m) {
   return D3DXVECTOR3((float)m[0], (float)m[2], (float)m[1]);
 }
 
-D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
+static D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
   D3DXMATRIX mtx_s, mtx_r, mtx_t;
 
   auto s = max_to_dx(mtx.GetS());
@@ -118,45 +121,10 @@ D3DXMATRIX max_to_dx(const FbxAMatrix &mtx) {
     *D3DXMatrixTranslation(&mtx_t, (float)t[0], (float)t[1], (float)t[2]);
 }
 
-void extract_prs(const FbxAMatrix &mtx, D3DXVECTOR3 *pos, D3DXVECTOR4 *rot, D3DXVECTOR3 *scale) {
+static void extract_prs(const FbxAMatrix &mtx, D3DXVECTOR3 *pos, D3DXVECTOR4 *rot, D3DXVECTOR3 *scale) {
   *pos = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(mtx.GetT()));
   *rot = max_to_dx(mtx.GetQ(), true);
   *scale = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(mtx.GetS()));
-}
-
-typedef float AnimType;
-void optimize_spline_fit(int dimension, int num_samples, AnimType *sample_data, AnimType err) {
-  using namespace Wm5;
-  int lo = 5;
-  int hi = num_samples;
-  int cur = 10;
-  while (lo < hi) {
-    BSplineCurveFit<AnimType> fitter(dimension, num_samples, sample_data, 3, cur);
-
-    // compute RMSD
-    AnimType d = 0;
-    for (int i = 0; i < num_samples; ++i) {
-      AnimType v[4];
-      fitter.GetPosition((AnimType)i/(num_samples-1), v);
-      AnimType e = 0;
-      for (int j = 0; j < dimension; ++j) {
-        AnimType c = sample_data[i*dimension+j];
-        e += (c - v[j]) * (c - v[j]);
-      }
-      d += e;
-    }
-    AnimType cur_err = sqrt(d/num_samples);
-    if (cur_err < err) {
-      hi = cur;
-    } else {
-      if (lo == cur) {
-        cur = hi;
-        break;
-      }
-      lo = cur;
-    }
-    cur = (lo + hi) / 2;
-  }
 }
 
 
@@ -176,23 +144,6 @@ FbxConverter::FbxConverter()
   _indent_buffer[cMaxIndent] = '\0';
 }
 
-FbxConverter::~FbxConverter() {
-
-}
-
-string to_string(const char *format, ...)
-{
-  string res;
-  va_list arg;
-  va_start(arg, format);
-  int len = _vscprintf(format, arg);
-  char *buf = (char *)_alloca(len + 1);
-  vsprintf_s(buf, len + 1, format, arg);
-  va_end(arg);
-  return string(buf);
-}
-
-
 #define CHECK_FATAL(x, msg, ...) if (!(x)) {_errors.push_back(string("!! ") + __FUNCTION__ + string(": ") + to_string(msg, __VA_ARGS__)); return false; }
 
 bool FbxConverter::convert(const char *src, const char *dst) {
@@ -211,7 +162,7 @@ bool FbxConverter::convert(const char *src, const char *dst) {
       add_error("unable to open log file!");
       return false;
     }
-
+    add_info("Input file: %s\nOutput file: %s", g_src.c_str(), g_dst.c_str());
 
     bool res = _importer->Initialize(src, -1, _settings);
     if (!res) {
@@ -313,124 +264,6 @@ bool FbxConverter::process_light(FbxNode *node, FbxLight *fbx_light) {
   return true;
 }
 
-void get_aspect_and_fov(FbxCamera *camera, double *fov_x, double *fov_y, double *aspect) {
-  // crazy amount of code to get the aspect ratio and fov
-  FbxCamera::EAspectRatioMode lCamAspectRatioMode = camera->GetAspectRatioMode();
-  double lAspectX = camera->AspectWidth.Get();
-  double lAspectY = camera->AspectHeight.Get();
-  double lAspectRatio = 1.333333;
-  switch( lCamAspectRatioMode)
-  {
-  case FbxCamera::eWindowSize:
-    lAspectRatio = lAspectX / lAspectY;
-    break;
-  case FbxCamera::eFixedRatio:
-    lAspectRatio = lAspectX;
-
-    break;
-  case FbxCamera::eFixedResolution:
-    lAspectRatio = lAspectX / lAspectY * camera->GetPixelRatio();
-    break;
-  case FbxCamera::eFixedWidth:
-    lAspectRatio = camera->GetPixelRatio() / lAspectY;
-    break;
-  case FbxCamera::eFixedHeight:
-    lAspectRatio = camera->GetPixelRatio() * lAspectX;
-    break;
-  default:
-    break;
-  }
-
-  //get the aperture ratio
-  double lFilmHeight = camera->GetApertureHeight();
-  double lFilmWidth = camera->GetApertureWidth() * camera->GetSqueezeRatio();
-  //here we use Height : Width
-  double lApertureRatio = lFilmHeight / lFilmWidth;
-
-
-  //change the aspect ratio to Height : Width
-  lAspectRatio = 1 / lAspectRatio;
-  //revise the aspect ratio and aperture ratio
-  FbxCamera::EGateFit cameraGateFit = camera->GateFit.Get();
-  switch( cameraGateFit )
-  {
-
-  case FbxCamera::eFitFill:
-    if( lApertureRatio > lAspectRatio)  // the same as eHORIZONTAL_FIT
-    {
-      lFilmHeight = lFilmWidth * lAspectRatio;
-      camera->SetApertureHeight( lFilmHeight);
-      lApertureRatio = lFilmHeight / lFilmWidth;
-    }
-    else if( lApertureRatio < lAspectRatio) //the same as eVERTICAL_FIT
-    {
-      lFilmWidth = lFilmHeight / lAspectRatio;
-      camera->SetApertureWidth( lFilmWidth);
-      lApertureRatio = lFilmHeight / lFilmWidth;
-    }
-    break;
-  case FbxCamera::eFitVertical:
-    lFilmWidth = lFilmHeight / lAspectRatio;
-    camera->SetApertureWidth( lFilmWidth);
-    lApertureRatio = lFilmHeight / lFilmWidth;
-    break;
-  case FbxCamera::eFitHorizontal:
-    lFilmHeight = lFilmWidth * lAspectRatio;
-    camera->SetApertureHeight( lFilmHeight);
-    lApertureRatio = lFilmHeight / lFilmWidth;
-    break;
-  case FbxCamera::eFitStretch:
-    lAspectRatio = lApertureRatio;
-    break;
-  case FbxCamera::eFitOverscan:
-    if( lFilmWidth > lFilmHeight)
-    {
-      lFilmHeight = lFilmWidth * lAspectRatio;
-    }
-    else
-    {
-      lFilmWidth = lFilmHeight / lAspectRatio;
-    }
-    lApertureRatio = lFilmHeight / lFilmWidth;
-    break;
-  case FbxCamera::eFitNone:
-  default:
-    break;
-  }
-  //change the aspect ratio to Width : Height
-  lAspectRatio = 1 / lAspectRatio;
-
-#define HFOV2VFOV(h, ar) (2.0 * atan((ar) * tan( (h * FBXSDK_PI_DIV_180) * 0.5)) * FBXSDK_180_DIV_PI) //ar : aspectY / aspectX
-#define VFOV2HFOV(v, ar) (2.0 * atan((ar) * tan( (v * FBXSDK_PI_DIV_180) * 0.5)) * FBXSDK_180_DIV_PI) //ar : aspectX / aspectY
-
-
-  double lFieldOfViewX = 0.0;
-  double lFieldOfViewY = 0.0;
-  if ( camera->GetApertureMode() == FbxCamera::eVertical)
-  {
-    lFieldOfViewY = camera->FieldOfView.Get();
-    lFieldOfViewX = VFOV2HFOV( lFieldOfViewY, 1 / lApertureRatio);
-  }
-  else if (camera->GetApertureMode() == FbxCamera::eHorizontal)
-  {
-    lFieldOfViewX = camera->FieldOfView.Get(); //get HFOV
-    lFieldOfViewY = HFOV2VFOV( lFieldOfViewX, lApertureRatio);
-  }
-  else if (camera->GetApertureMode() == FbxCamera::eFocalLength)
-  {
-    lFieldOfViewX = camera->ComputeFieldOfView(camera->FocalLength.Get());    //get HFOV
-    lFieldOfViewY = HFOV2VFOV( lFieldOfViewX, lApertureRatio);
-  }
-  else if (camera->GetApertureMode() == FbxCamera::eHorizAndVert) {
-    lFieldOfViewX = camera->FieldOfViewX.Get();
-    lFieldOfViewY = camera->FieldOfViewY.Get();
-  }
-
-  *aspect = lAspectRatio;
-  *fov_x = lFieldOfViewX;
-  *fov_y = lFieldOfViewY;
-}
-
 bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
 
   INFO_SCOPE;
@@ -482,32 +315,6 @@ bool FbxConverter::process_camera(FbxNode *node, FbxCamera *camera) {
   return true;
 }
 
-static FbxDouble3 GetMaterialProperty(const FbxSurfaceMaterial *pMaterial, const char *pPropertyName, const char *pFactorPropertyName, string *filename)
-{
-  FbxDouble3 lResult(0, 0, 0);
-  const FbxProperty lProperty = pMaterial->FindProperty(pPropertyName);
-  const FbxProperty lFactorProperty = pMaterial->FindProperty(pFactorPropertyName);
-  if (lProperty.IsValid() && lFactorProperty.IsValid()) {
-    lResult = lProperty.Get<FbxDouble3>();
-    double lFactor = lFactorProperty.Get<FbxDouble>();
-    if (lFactor != 1) {
-      lResult[0] *= lFactor;
-      lResult[1] *= lFactor;
-      lResult[2] *= lFactor;
-    }
-  }
-
-  // get the filename
-  if (filename && lProperty.IsValid()) {
-    if (int lTextureCount = lProperty.GetSrcObjectCount(FbxFileTexture::ClassId)) {
-      if (const FbxFileTexture* lTexture = lProperty.GetSrcObject(FBX_TYPE(FbxFileTexture), 0)) {
-        *filename = lTexture->GetFileName();
-      }
-    }
-  }
-
-  return lResult;
-}
 
 void FbxConverter::copy_texture(string src, string *dst) {
 
@@ -622,98 +429,6 @@ bool FbxConverter::process_material(FbxNode *fbx_node, int *material_count) {
   return true;
 }
 
-// Get the geometry offset to a node. It is never inherited by the children.
-FbxAMatrix GetGeometry(FbxNode* pNode)
-{
-  const FbxVector4 lT = pNode->GetGeometricTranslation(FbxNode::eSourcePivot);
-  const FbxVector4 lR = pNode->GetGeometricRotation(FbxNode::eSourcePivot);
-  const FbxVector4 lS = pNode->GetGeometricScaling(FbxNode::eSourcePivot);
-
-  return FbxAMatrix(lT, lR, lS);
-}
-
-void print_matrix(const FbxAMatrix &mtx) {
-  char buf[512];
-  sprintf(buf, "[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n[ %.5f %.5f %.5f %.5f ]\n", 
-    mtx.Get(0, 0), mtx.Get(0, 1), mtx.Get(0, 2), mtx.Get(0, 3),
-    mtx.Get(1, 0), mtx.Get(1, 1), mtx.Get(1, 2), mtx.Get(1, 3),
-    mtx.Get(2, 0), mtx.Get(2, 1), mtx.Get(2, 2), mtx.Get(2, 3),
-    mtx.Get(3, 0), mtx.Get(3, 1), mtx.Get(3, 2), mtx.Get(3, 3));
-  OutputDebugStringA(buf);
-}
-
-
-FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex);
-FbxAMatrix GetGlobalPosition(FbxNode* pNode, const FbxTime& pTime, FbxPose* pPose = NULL, FbxAMatrix* pParentGlobalPosition = NULL);
-FbxAMatrix GetGlobalPosition(FbxNode* pNode, const FbxTime& pTime, FbxPose* pPose, FbxAMatrix* pParentGlobalPosition)
-{
-  FbxAMatrix lGlobalPosition;
-  bool        lPositionFound = false;
-
-  if (pPose)
-  {
-    int lNodeIndex = pPose->Find(pNode);
-
-    if (lNodeIndex > -1)
-    {
-      // The bind pose is always a global matrix.
-      // If we have a rest pose, we need to check if it is
-      // stored in global or local space.
-      if (pPose->IsBindPose() || !pPose->IsLocalMatrix(lNodeIndex))
-      {
-        lGlobalPosition = GetPoseMatrix(pPose, lNodeIndex);
-      }
-      else
-      {
-        // We have a local matrix, we need to convert it to
-        // a global space matrix.
-        FbxAMatrix lParentGlobalPosition;
-
-        if (pParentGlobalPosition)
-        {
-          lParentGlobalPosition = *pParentGlobalPosition;
-        }
-        else
-        {
-          if (pNode->GetParent())
-          {
-            lParentGlobalPosition = GetGlobalPosition(pNode->GetParent(), pTime, pPose);
-          }
-        }
-
-        FbxAMatrix lLocalPosition = GetPoseMatrix(pPose, lNodeIndex);
-        lGlobalPosition = lParentGlobalPosition * lLocalPosition;
-      }
-
-      lPositionFound = true;
-    }
-  }
-
-  if (!lPositionFound)
-  {
-    // There is no pose entry for that node, get the current global position instead.
-
-    // Ideally this would use parent global position and local position to compute the global position.
-    // Unfortunately the equation 
-    //    lGlobalPosition = pParentGlobalPosition * lLocalPosition
-    // does not hold when inheritance type is other than "Parent" (RSrs).
-    // To compute the parent rotation and scaling is tricky in the RrSs and Rrs cases.
-    lGlobalPosition = pNode->EvaluateGlobalTransform(pTime);
-  }
-
-  return lGlobalPosition;
-}
-
-// Get the matrix of the given pose
-FbxAMatrix GetPoseMatrix(FbxPose* pPose, int pNodeIndex)
-{
-  FbxAMatrix lPoseMatrix;
-  FbxMatrix lMatrix = pPose->GetMatrix(pNodeIndex);
-
-  memcpy((double*)lPoseMatrix, (double*)lMatrix, sizeof(lMatrix.mData));
-
-  return lPoseMatrix;
-}
 
 template<class T>
 bool is_static_animation(const vector<T> &org, const function<float(const T& a, const T& b)> &distance) {
@@ -755,107 +470,6 @@ vector<int> remove_keyframes(const vector<T> &org, const function<float(const T&
   }
 
   return res;
-}
-
-int sign(float a) {
-  return a < 0 ? -1 : a > 0 ? 1 : 0;
-}
-
-template <typename T>
-struct SamplePoint {
-  SamplePoint(float t, const T &value) : t(t), value(value) {}
-  float t;
-  T value;
-};
-
-template <typename T>
-struct Segment {
-  Segment(const SamplePoint<T> &p0, const SamplePoint<T> &p1, int start, int end) : p0(p0), p1(p1), sample_start(start), sample_end(end), err(0) {}
-  SamplePoint<T> p0, p1;
-  int sample_start, sample_end; // [sample_start, sample_end)
-  double err;
-};
-
-template <typename T>
-T sample_point(float t, const Segment<T> &segment) {
-  auto &a = segment.p0;
-  auto &b = segment.p1;
-  float f = (t - a.t) / (b.t - a.t);
-  return a.value + f * (b.value - a.value);
-}
-
-float length_sq(const D3DXVECTOR3 &v) {
-  return D3DXVec3LengthSq(&v);
-}
-
-float length_sq(const D3DXVECTOR4 &v) {
-  return D3DXVec4LengthSq(&v);
-}
-
-template <typename T>
-double calc_error(const vector<SamplePoint<T>> &points, const Segment<T> &segment) {
-
-  double err = 0;
-  for (int i = segment.sample_start; i < segment.sample_end; ++i) {
-    T pt = sample_point(points[i].t, segment);
-    err += length_sq(pt - points[i].value);
-  }
-  return err / (segment.sample_end - segment.sample_start);
-}
-
-template <typename T>
-deque<Segment<T>> linear_fit(const vector<SamplePoint<T>> &points, double threshold) {
-
-  typedef Segment<T> SegT;
-
-  // add a single line segment
-  deque<SegT> segments;
-  segments.push_back(SegT(points.front(), points.back(), 0, points.size() - 1));
-  segments.back().err = calc_error(points, segments.back());
-
-  deque<SegT> done_segments;
-
-  while (!segments.empty()) {
-    double total_err = 0;
-    for (size_t i = 0; i < segments.size(); ++i)
-      total_err += segments[i].err;
-
-    if (total_err < threshold)
-      break;
-
-    // sort segments by error
-    sort(RANGE(segments), [&](const SegT &a, const SegT &b) { return a.err > b.err; });
-
-    // split the segment with the largest error into 2
-    auto largest_err = segments.front();
-    segments.pop_front();
-
-    int s = largest_err.sample_start;
-    int e = largest_err.sample_end;
-    int middle = (s + e) / 2;
-    SegT s0(points[s], points[middle], s, middle);
-    SegT s1(points[middle], points[e], middle, e);
-
-    s0.err = calc_error(points, s0);
-    s1.err = calc_error(points, s1);
-
-    if (middle - s <= 1) {
-      done_segments.push_back(s0);
-    } else {
-      segments.push_back(s0);
-    }
-
-    if (e - middle <= 1) {
-      done_segments.push_back(s1);
-    } else {
-      segments.push_back(s1);
-    }
-  }
-
-  copy(RANGE(done_segments), back_inserter(segments));
-  sort(RANGE(segments), [&](const SegT &a, const SegT &b) { return a.sample_start < b.sample_start; });
-
-  return segments;
 }
 
 bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool *is_static) {
@@ -1044,6 +658,9 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   FbxLayer *layer = fbx_mesh->GetLayer(0);
   CHECK_FATAL(layer, "no layer 0 found");
 
+  auto *tangents = layer->GetTangents() ? &layer->GetTangents()->GetDirectArray() : nullptr;
+  auto *binormals = layer->GetBinormals() ? &layer->GetBinormals()->GetDirectArray() : nullptr;
+
   // group the polygons by material
   vector<vector<int>> polys_by_material;
   polys_by_material.resize(max(1, material_count));
@@ -1109,6 +726,9 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   for (size_t i = 0; i < polys_by_material.size(); ++i) {
 
     uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
+    if (tangents && binormals) {
+      vertex_flags |= SubMesh::kTex0 | SubMesh::kTangentSpace;
+    }
 
     if (!use_default_material) {
       // check if the current material uses a diffuse map
@@ -1121,7 +741,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     }
 
     // keep track of the unique vertices
-    set<SuperVertex> super_verts;
+    set<VertexElement> super_verts;
 
     const string material_name = use_default_material ? "default-material" : fbx_node->GetMaterial(i)->GetName();
     string submesh_name = polys_by_material.size() > 1 ? to_string("%s_%d", fbx_node->GetName(), i) : fbx_node->GetName();
@@ -1144,7 +764,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       // we reverse the winding order to convert between the right and left-handed systems
       for (int k = 2; k >= 0; --k) {
 
-        auto fbxPos = fbx_mesh->GetControlPointAt(fbx_mesh->GetPolygonVertex(poly_idx, k));
+        int polyVtx = fbx_mesh->GetPolygonVertex(poly_idx, k);
+        auto fbxPos = fbx_mesh->GetControlPointAt(polyVtx);
         FbxVector4 fbxNormal;
         fbx_mesh->GetPolygonVertexNormal(poly_idx, k, fbxNormal);
 
@@ -1157,26 +778,37 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         auto pos3 = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxPos));
         verts.push_back(pos3);
         auto normal3 = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxNormal));
+        D3DXVec3Normalize(&normal3, &normal3);
 
-        SuperVertex cand(pos3, normal3);
+        // Create the super vertex
+        VertexElement cand(pos3, normal3);
         for (size_t uv_idx = 0; uv_idx  < uv_sets.size(); ++uv_idx) {
           FbxVector2 uv;
           fbx_mesh->GetPolygonVertexUV(poly_idx, k, uv_sets[uv_idx].c_str(), uv);
           // flip the y-coordinate to match DirectX
           uv[1] = 1 - uv[1];
-          cand.uv.push_back(D3DXVECTOR2((float)uv[0], (float)uv[1]));
+          if (uv_idx == 0) {
+            cand.tex0 = D3DXVECTOR2((float)uv[0], (float)uv[1]);
+          } else if (uv_idx == 1) {
+            cand.tex1 = D3DXVECTOR2((float)uv[0], (float)uv[1]);
+          } else {
+            add_error("Too many uv-sets!");
+          }
         }
 
-        // create a supervertex for the current vertex, and check if it already exists to
-        // determine what vertex index to give it
-        int idx = -1;
-        set<SuperVertex>::iterator it = super_verts.find(cand);
+        if (vertex_flags & SubMesh::kTangentSpace) {
+          cand.tangent = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx((*tangents)[polyVtx]));
+          cand.binormal = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx((*binormals)[polyVtx]));
+          D3DXVec3Normalize(&cand.tangent, &cand.tangent);
+          D3DXVec3Normalize(&cand.binormal, &cand.binormal);
+        }
+
+        int idx;
+        // Check if the super vertex already exists
+        auto it = super_verts.find(cand);
         if (it == super_verts.end()) {
-          idx = cand.idx = sub_mesh->pos.size();
-          sub_mesh->pos.push_back(pos3);
-          sub_mesh->normal.push_back(normal3);
-          if (vertex_flags & SubMesh::kTex0) sub_mesh->tex0.push_back(cand.uv[0]);
-          if (vertex_flags & SubMesh::kTex1) sub_mesh->tex1.push_back(cand.uv[1]);
+          idx = cand.idx = sub_mesh->vertices.size();
+          sub_mesh->vertices.push_back(cand);
           super_verts.insert(cand);
         } else {
           // vertex already exists, so reuse the vertex index
@@ -1187,35 +819,22 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     }
 
     if (g_optimize_mesh) {
-      vector<int> optimized_indices;
+      vector<int> optimzedIndices;
       vector<int> vertex_reorder;
-      VertexOptimizer opt(sub_mesh->pos.size());
-      opt.AddTriangles(sub_mesh->indices.data(), sub_mesh->indices.size(), &optimized_indices, &vertex_reorder);
-      assert(sub_mesh->indices.size() == optimized_indices.size());
+      VertexOptimizer opt(sub_mesh->vertices.size());
+      opt.AddTriangles(sub_mesh->indices.data(), sub_mesh->indices.size(), &optimzedIndices, &vertex_reorder);
+      assert(sub_mesh->indices.size() == optimzedIndices.size());
 
       // we need to reorder the pos/normal etc now to match the new optimized order
-      vector<D3DXVECTOR3> opt_pos(sub_mesh->pos.size());
-      vector<D3DXVECTOR3> opt_normal(sub_mesh->normal.size());
+      vector<VertexElement> optimzedVerts(sub_mesh->vertices.size());
 
-      for (size_t i = 0; i < sub_mesh->pos.size(); ++i) {
+      for (size_t i = 0; i < sub_mesh->vertices.size(); ++i) {
         int idx = vertex_reorder[i];
-        opt_pos[idx] = sub_mesh->pos[i];
-        opt_normal[idx] = sub_mesh->normal[i];
+        optimzedVerts[idx] = sub_mesh->vertices[i];
       }
 
-      sub_mesh->pos = opt_pos;
-      sub_mesh->normal = opt_normal;
-
-      if (!sub_mesh->tex0.empty()) {
-        vector<D3DXVECTOR2> opt_tex0(sub_mesh->tex0.size());
-        for (size_t i = 0; i < sub_mesh->pos.size(); ++i) {
-          int idx = vertex_reorder[i];
-          opt_tex0[idx] = sub_mesh->tex0[i];
-        }
-        sub_mesh->tex0 = opt_tex0;
-      }
-
-      sub_mesh->indices = optimized_indices;
+      sub_mesh->vertices = optimzedVerts;
+      sub_mesh->indices = optimzedIndices;
     }
   }
 
@@ -1228,10 +847,10 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
     D3DXVECTOR3 ofs(mesh->center);
     for (size_t i = 0; i < mesh->sub_meshes.size(); ++i) {
       SubMesh *submesh = mesh->sub_meshes[i].get();
-      vector<D3DXVECTOR3> &verts = submesh->pos;
+      auto &verts = submesh->vertices;
       size_t numVerts = verts.size();
       for (size_t j = 0; j < numVerts; ++j) {
-        verts[j] -= ofs;
+        verts[j].pos -= ofs;
       }
     }
     mesh->pos += mesh->center;
@@ -1606,7 +1225,7 @@ bool FbxConverter::save_meshes() {
       _writer->write(sub->element_size);
       _writer->write(index_size);
 
-      _writer->write((int)sub->pos.size());
+      _writer->write((int)sub->vertices.size());
       _writer->write((int)sub->indices.size());
 
       uint8 *vb, *ib;
@@ -1617,7 +1236,7 @@ bool FbxConverter::save_meshes() {
       _writer->add_deferred_binary(ib, (ib_len + 7) / 8);
 
       _stats.num_indices += sub->indices.size();
-      _stats.num_verts += sub->pos.size();
+      _stats.num_verts += sub->vertices.size();
       _stats.vert_data_size += (vb_len + 7) / 8;
       _stats.index_data_size += (ib_len + 7) / 8;
 
@@ -1828,38 +1447,64 @@ int parse_cmd_line(LPSTR lpCmdLine) {
 
   int argc = (int)tokens.size();
 
-  if (argc < 2) {
-    printf("syntax: %s [--verbose] [--watch] [--no-anim] [--no-opt] [--pos-bits NN] [--normal-bits NN] [--tex-bits NN] [--anim-bits NN] src dst", module_name);
+  int arg_count = 0;
+  int num_args = argc - 1;
+  for (int i = 0; i < num_args; ++i) {
+
+    if (tokens[i] == "--verbose") {
+      arg_count++;
+      g_verbose = true;
+    }
+
+    if (tokens[i] == "--watch") {
+      arg_count++;
+      g_file_watch = true;
+    }
+
+    if (tokens[i] == "--no-anim") {
+      arg_count++;
+      g_export_animation = false;
+    }
+
+    if (tokens[i] == "--no-opt") {
+      arg_count++;
+      g_optimize_mesh = false;
+    }
+
+    if (tokens[i] == "--pos-bits" && i != num_args - 1) {
+      arg_count += 2;
+      g_position_bits = atoi(tokens[++i].c_str());
+    }
+
+    if (tokens[i] == "--normal-bits" && i != num_args - 1) {
+      arg_count += 2;
+      g_normal_bits = atoi(tokens[++i].c_str());
+    }
+
+    if (tokens[i] == "--tex-bits" && i != num_args - 1) {
+      arg_count += 2;
+      g_texcoord_bits = atoi(tokens[++i].c_str());
+    }
+
+    if (tokens[i] == "--anim-bits" && i != num_args - 1) {
+      arg_count += 2;
+      g_animation_bits = atoi(tokens[++i].c_str());
+    }
+  }
+
+  int numFiles = argc - arg_count;
+  if (numFiles < 1) {
+    printf("syntax: %s [--verbose] [--watch] [--no-anim] [--no-opt] [--pos-bits NN] [--normal-bits NN] [--tex-bits NN] [--anim-bits NN] src [dst]", module_name);
     return 1;
   }
 
-  int num_args = argc - 2;
-  for (int i = 0; i < num_args; ++i) {
-    g_verbose     |= tokens[i] == "--verbose";
-    g_file_watch  |= tokens[i] == "--watch";
-
-    if (tokens[i] == "--no-anim")
-      g_export_animation = false;
-
-    if (tokens[i] == "--no-opt")
-      g_optimize_mesh = false;
-
-    if (tokens[i] == "--pos-bits" && i != num_args - 1)
-      g_position_bits = atoi(tokens[++i].c_str());
-
-    if (tokens[i] == "--normal-bits" && i != num_args - 1)
-      g_normal_bits = atoi(tokens[++i].c_str());
-
-    if (tokens[i] == "--tex-bits" && i != num_args - 1)
-      g_texcoord_bits = atoi(tokens[++i].c_str());
-
-    if (tokens[i] == "--anim-bits" && i != num_args - 1)
-      g_animation_bits = atoi(tokens[++i].c_str());
-
+  if (numFiles == 1) {
+    g_src = g_inputDir + tokens[argc-1] + ".fbx";
+    g_dst = g_outputDir + tokens[argc-1] + ".kumi";
+  } else {
+    g_src = tokens[argc-2];
+    g_dst = tokens[argc-1];
   }
-
-  g_src = tokens[argc-2].c_str();
-  g_dst = tokens[argc-1].c_str();
 
   replace(RANGE(g_src), '\\', '/');
   replace(RANGE(g_dst), '\\', '/');
@@ -1932,17 +1577,14 @@ DWORD WINAPI WatcherThread(LPVOID param) {
 
 
 void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer) {
-  int len = submesh->element_size * submesh->pos.size();
+  int len = submesh->element_size * submesh->vertices.size();
 
   Mesh *mesh = submesh->mesh;
-  for (size_t i = 0; i < submesh->pos.size(); ++i) {
-/*
-    add_verbose("%f, %f, %f, %f, %f, %f", 
-      submesh->pos[i].x, submesh->pos[i].y, submesh->pos[i].z, 
-      submesh->normal[i].x, submesh->normal[i].y, submesh->normal[i].z);
-*/
+  for (size_t i = 0; i < submesh->vertices.size(); ++i) {
+
+    auto &vtx = submesh->vertices[i];
     // save vertices as 14 bit
-    D3DXVECTOR3 ofs = submesh->pos[i] - mesh->center;
+    D3DXVECTOR3 ofs = vtx.pos - mesh->center;
     ofs.x /= (fabs(mesh->extents.x) > 0.001f ? mesh->extents.x : 1);
     ofs.y /= (fabs(mesh->extents.y) > 0.001f ? mesh->extents.y : 1);
     ofs.z /= (fabs(mesh->extents.z) > 0.001f ? mesh->extents.z : 1);
@@ -1955,21 +1597,28 @@ void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer
     writer->write(quantize(ofs.y, g_position_bits), g_position_bits);
     writer->write(quantize(ofs.z, g_position_bits), g_position_bits);
 
-    // save normal as 11 bit x/y, and 1 sign bit for z
-    D3DXVECTOR3 n = submesh->normal[i];
-    D3DXVec3Normalize(&n, &n);
-    writer->write(quantize(n.x, g_normal_bits), g_normal_bits);
-    writer->write(quantize(n.y, g_normal_bits), g_normal_bits);
-    writer->write(n.z < 0 ? 1 : 0, 1);
+    int vertexFlags = submesh->vertex_flags;
 
-    if (submesh->vertex_flags & SubMesh::kTex0) {
-      // 11 bit u/v
-      writer->write(quantize(submesh->tex0[i].x, g_texcoord_bits), g_texcoord_bits);
-      writer->write(quantize(submesh->tex0[i].y, g_texcoord_bits), g_texcoord_bits);
+    auto &writeNormal = [&](const D3DXVECTOR3 &n) {
+      // save normal as 11 bit x/y, and 1 sign bit for z
+      writer->write(quantize(n.x, g_normal_bits), g_normal_bits);
+      writer->write(quantize(n.y, g_normal_bits), g_normal_bits);
+      writer->write(n.z < 0 ? 1 : 0, 1);
+    };
+    writeNormal(vtx.normal);
+    if (vertexFlags & SubMesh::kTangentSpace) {
+      writeNormal(vtx.tangent);
+      writeNormal(vtx.binormal);
     }
-    if (submesh->vertex_flags & SubMesh::kTex1) {
-      writer->write(quantize(submesh->tex1[i].x, g_texcoord_bits), g_texcoord_bits);
-      writer->write(quantize(submesh->tex1[i].y, g_texcoord_bits), g_texcoord_bits);
+
+    if (vertexFlags & SubMesh::kTex0) {
+      // 11 bit u/v
+      writer->write(quantize(vtx.tex0.x, g_texcoord_bits), g_texcoord_bits);
+      writer->write(quantize(vtx.tex0.y, g_texcoord_bits), g_texcoord_bits);
+    }
+    if (vertexFlags & SubMesh::kTex1) {
+      writer->write(quantize(vtx.tex1.x, g_texcoord_bits), g_texcoord_bits);
+      writer->write(quantize(vtx.tex1.y, g_texcoord_bits), g_texcoord_bits);
     }
   }
 }
@@ -1978,7 +1627,7 @@ void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer
 void FbxConverter::compact_index_data(const SubMesh *submesh, BitWriter *writer, int *index_size) {
 
   // check if we need 16 or 32 bit indices
-  const size_t num_verts = max4(submesh->pos.size(), submesh->normal.size(), submesh->tex0.size(), submesh->tex1.size());
+  const size_t num_verts = submesh->vertices.size();
   const bool need_32_bit = num_verts >= (1 << 16);
   *index_size = need_32_bit ? 4 : 2;
 
@@ -2026,107 +1675,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   return DefWindowProc(hwnd, msg, wparam, lparam);
 }
 
-void extract(float *baked, float t, float *extracted) {
-  float t2 = t*t;
-  float t3 = t2*t;
-  extracted[0] = 6 * baked[0] / (1-3*t+3*t2+t3);
-  extracted[1] = 6 * baked[1] / (4-6*t2+3*t3);
-  extracted[2] = 6 * baked[2] / (1+3*t+3*t2-3*t3);
-  extracted[3] = t3 > 0 ? 6 * baked[3] / t3 : 0;
-}
-
-typedef double Real;
-int mQuantity = 20;
-int mDegree = 3;
-
-Real mValue[4];
-Real mKnot[6];
-
-// Stolen from Wm5BSplineFitBasis
-void compute_factors(float t, int& imin, int& imax) {
-
-  // Use scaled time and scaled knots so that 1/(Q-D) does not need to
-  // be explicitly stored by the class object.  Determine the extreme
-  // indices affected by local control.
-  Real QmD = (Real)(mQuantity - mDegree);
-  Real tValue;
-  if (t <= (Real)0)
-  {
-    tValue = (Real)0;
-    imin = 0;
-    imax = mDegree;
-  }
-  else if (t >= (Real)1)
-  {
-    tValue = QmD;
-    imax = mQuantity - 1;
-    imin = imax - mDegree;
-  }
-  else
-  {
-    tValue = QmD*t;
-    imin = (int)tValue;
-    imax = imin + mDegree;
-  }
-
-  // Precompute the knots.
-  for (int i0 = 0, i1 = imax+1-mDegree; i0 < 2*mDegree; ++i0, ++i1)
-  {
-    if (i1 <= mDegree)
-    {
-      mKnot[i0] = (Real)0;
-    }
-    else if (i1 >= mQuantity)
-    {
-      mKnot[i0] = QmD;
-    }
-    else
-    {
-      mKnot[i0] = (Real)(i1 - mDegree);
-    }
-  }
-
-  // Initialize the basis function evaluation table.  The first degree-1
-  // entries are zero, but they do not have to be set explicitly.
-  mValue[mDegree] = (Real)1;
-
-  // Update the basis function evaluation table, each iteration overwriting
-  // the results from the previous iteration.
-  for (int row = mDegree-1; row >= 0; --row)
-  {
-    int k0 = mDegree, k1 = row;
-    Real knot0 = mKnot[k0], knot1 = mKnot[k1];
-    Real invDenom = ((Real)1)/(knot0 - knot1);
-    Real c1 = (knot0 - tValue)*invDenom, c0;
-    mValue[row] = c1*mValue[row + 1];
-
-    for (int col = row + 1; col < mDegree; ++col)
-    {
-      c0 = (tValue - knot1)*invDenom;
-      mValue[col] *= c0;
-
-      knot0 = mKnot[++k0];
-      knot1 = mKnot[++k1];
-      invDenom = ((Real)1)/(knot0 - knot1);
-      c1 = (knot0 - tValue)*invDenom;
-      mValue[col] += c1*mValue[col + 1];
-    }
-
-    c0 = (tValue - knot1)*invDenom;
-    mValue[mDegree] *= c0;
-  }
-}
-
-
-
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
-
-  using namespace Wm5;
-  Memory::Initialize();
 
   AllocConsole();
   freopen("CONOUT$","wb",stdout);
   freopen("CONOUT$","wb",stderr);
+
+  char iniFile[MAX_PATH];
+  _getcwd(iniFile, sizeof(iniFile));
+  strcat(iniFile, "\\fbx_conv.ini");
+
+  char inputDir[MAX_PATH], outputDir[MAX_PATH];
+  int inputLen = GetPrivateProfileString("Settings", "InputDir", "", inputDir, sizeof(inputDir), iniFile);
+  int outputLen = GetPrivateProfileString("Settings", "OutputDir", "", outputDir, sizeof(outputDir), iniFile);
+
+  if (inputLen && outputLen) {
+    g_inputDir = inputDir;
+    g_outputDir = outputDir;
+    auto &normalize = [&](string *str) {
+      if (str->back() != '\\' && str->back() != '/')
+        (*str) += "\\";
+    };
+    normalize(&g_inputDir);
+    normalize(&g_outputDir);
+  }
 
   HANDLE console_handle = GetStdHandle(STD_INPUT_HANDLE);
 
@@ -2192,9 +1764,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SAFE_DELETE(g_converter);
   }
 
-  FreeConsole();
+  printf("Done.\n");
+  while (!is_bit_set(GetAsyncKeyState(VK_ESCAPE), 15))
+    ;
 
-  Memory::Terminate("fbx_conv_memory.log");
+  FreeConsole();
 
   return msg.wParam;
 }

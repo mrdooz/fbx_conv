@@ -2,6 +2,8 @@
 #include "utils.hpp"
 #include "fbx_conv.hpp"
 
+using namespace std;
+
 void split_path(const char *path, std::string *drive, std::string *dir, std::string *fname, std::string *ext) {
   char drive_buf[_MAX_DRIVE];
   char dir_buf[_MAX_DIR];
@@ -27,3 +29,17 @@ ScopedBlock::~ScopedBlock() {
   writer.write(header);
   writer.pop_pos();
 }
+
+
+string to_string(const char *format, ...)
+{
+  string res;
+  va_list arg;
+  va_start(arg, format);
+  int len = _vscprintf(format, arg);
+  char *buf = (char *)_alloca(len + 1);
+  vsprintf_s(buf, len + 1, format, arg);
+  va_end(arg);
+  return string(buf);
+}
+
