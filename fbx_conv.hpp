@@ -1,14 +1,15 @@
 #pragma once
 
-#define FILE_VERSION 13
+#define FILE_VERSION 14
 
 #pragma pack(push, 1)
 struct MainHeader {
   int version;
-  int position_bits;
-  int normal_bits;
-  int texcoord_bits;
-  int animation_bits;
+  bool compressedVertices;
+  uint8 position_bits;
+  uint8 normal_bits;
+  uint8 texcoord_bits;
+  uint8 animation_bits;
   int global_ofs;
   int material_ofs;
   int mesh_ofs;

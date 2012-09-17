@@ -15,15 +15,17 @@ using namespace stdext;
 class FbxConverter;
 
 bool g_verbose;
-bool g_export_animation = true;
-bool g_optimize_mesh = true;
+bool gExportAnimation = true;
+bool gOptimizeMesh = true;
 bool g_optimize_spline = false;
 
-int g_position_bits = 14;
-int g_normal_bits = 11;
-int g_texcoord_bits = 10;
-int g_animation_bits = 16;
+int gPositionBits = 14;
+int gNormalBits = 11;
+int gTexCoordBits = 10;
+int gAnimationBits = 16;
 int g_num_control_points = 100;
+
+bool gCompressVertices = false;
 
 bool g_file_watch;
 FbxConverter *g_converter;
@@ -33,15 +35,16 @@ string g_inputDir, g_outputDir;
 HWND g_hwnd;
 HANDLE g_dir;
 HANDLE g_quit_event;
+string gAppRoot;
 
 const int WM_USER_CONVERT_FILE = WM_USER + 1;
 const int FILE_CHANGED_TIMER_ID = 1;
 
 
 #if _DEBUG
-#pragma comment(lib, "fbxsdk-2013.1-mdd.lib")
+#pragma comment(lib, "fbxsdk-2013.2-mdd.lib")
 #else
-#pragma comment(lib, "fbxsdk-2013.1-md.lib")
+#pragma comment(lib, "fbxsdk-2013.2-md.lib")
 #endif
 
 #pragma comment(lib, "d3dx10.lib")
@@ -475,7 +478,7 @@ vector<int> remove_keyframes(const vector<T> &org, const function<float(const T&
 bool FbxConverter::process_animation(FbxNode *node, bool translation_only, bool *is_static) {
   INFO_SCOPE;
 
-  if (!g_export_animation) {
+  if (!gExportAnimation) {
     *is_static = true;
     return true;
   }
@@ -658,8 +661,8 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   FbxLayer *layer = fbx_mesh->GetLayer(0);
   CHECK_FATAL(layer, "no layer 0 found");
 
-  auto *tangents = layer->GetTangents() ? &layer->GetTangents()->GetDirectArray() : nullptr;
-  auto *binormals = layer->GetBinormals() ? &layer->GetBinormals()->GetDirectArray() : nullptr;
+  int tangentRefMode = layer->GetTangents() ? layer->GetTangents()->GetReferenceMode() : -1;
+  int binormalRefMode = layer->GetBinormals() ? layer->GetBinormals()->GetReferenceMode() : -1;
 
   // group the polygons by material
   vector<vector<int>> polys_by_material;
@@ -726,8 +729,15 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
   for (size_t i = 0; i < polys_by_material.size(); ++i) {
 
     uint32 vertex_flags = SubMesh::kPos | SubMesh::kNormal;
-    if (tangents && binormals) {
-      vertex_flags |= SubMesh::kTex0 | SubMesh::kTangentSpace;
+
+    if (tangentRefMode != -1) {
+      // Add tangent space if the mesh has a bump mapped material
+      FbxSurfaceMaterial *material = fbx_node->GetMaterial(i);
+      const char *name = material->GetName();
+      string filename;
+      GetMaterialProperty(material, FbxSurfaceMaterial::sBump, FbxSurfaceMaterial::sBumpFactor, &filename);
+      if (!filename.empty())
+        vertex_flags |= SubMesh::kTex0 | SubMesh::kTangentSpace;
     }
 
     if (!use_default_material) {
@@ -797,8 +807,29 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
         }
 
         if (vertex_flags & SubMesh::kTangentSpace) {
-          cand.tangent = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx((*tangents)[polyVtx]));
-          cand.binormal = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx((*binormals)[polyVtx]));
+          FbxVector4 fbxTangent, fbxBinormal;
+
+          if (tangentRefMode == FbxLayerElement::eDirect) {
+            fbxTangent = layer->GetTangents()->GetDirectArray()[polyVtx + k];
+          } else {
+            int idx = layer->GetTangents()->GetIndexArray()[polyVtx + k];
+            fbxTangent = layer->GetTangents()->GetDirectArray()[idx];
+          }
+
+          if (binormalRefMode == FbxLayerElement::eDirect) {
+            fbxBinormal = layer->GetBinormals()->GetDirectArray()[polyVtx + k];
+          } else {
+            int idx = layer->GetBinormals()->GetIndexArray()[polyVtx + k];
+            fbxBinormal = layer->GetBinormals()->GetDirectArray()[idx];
+          }
+
+          if (isStatic) {
+            fbxTangent = mtxTransformNormal.MultT(fbxTangent);
+            fbxBinormal = mtxTransformNormal.MultT(fbxBinormal);
+          }
+
+          cand.tangent = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxTangent));
+          cand.binormal = drop<D3DXVECTOR4, D3DXVECTOR3>(max_to_dx(fbxBinormal));
           D3DXVec3Normalize(&cand.tangent, &cand.tangent);
           D3DXVec3Normalize(&cand.binormal, &cand.binormal);
         }
@@ -818,7 +849,7 @@ bool FbxConverter::process_mesh(FbxNode *fbx_node, FbxMesh *fbx_mesh) {
       }
     }
 
-    if (g_optimize_mesh) {
+    if (gOptimizeMesh) {
       vector<int> optimzedIndices;
       vector<int> vertex_reorder;
       VertexOptimizer opt(sub_mesh->vertices.size());
@@ -917,10 +948,11 @@ bool FbxConverter::save_scene(const char *dst) {
   header.version = FILE_VERSION;
   _writer->push_pos();
   _writer->write(header);
-  header.position_bits = g_position_bits;
-  header.normal_bits = g_normal_bits;
-  header.texcoord_bits = g_texcoord_bits;
-  header.animation_bits = g_animation_bits;
+  header.compressedVertices = gCompressVertices;
+  header.position_bits = gPositionBits;
+  header.normal_bits = gNormalBits;
+  header.texcoord_bits = gTexCoordBits;
+  header.animation_bits = gAnimationBits;
 
   header.global_ofs = _writer->pos();
   CHECKED_CALL(save_globals());
@@ -1039,9 +1071,9 @@ bool FbxConverter::save_animations(const vector<KeyFrameVec3> &frames) {
       float t = (float)frames[i].time;
       writer.write(*(uint32 *)&t, 32);
       const D3DXVECTOR3 &cur = frames[i].value;
-      writer.write(quantize((cur.x - center.x) / extents.x, g_animation_bits), g_animation_bits);
-      writer.write(quantize((cur.y - center.y) / extents.y, g_animation_bits), g_animation_bits);
-      writer.write(quantize((cur.z - center.z) / extents.z, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.x - center.x) / extents.x, gAnimationBits), gAnimationBits);
+      writer.write(quantize((cur.y - center.y) / extents.y, gAnimationBits), gAnimationBits);
+      writer.write(quantize((cur.z - center.z) / extents.z, gAnimationBits), gAnimationBits);
     }
   }
 
@@ -1081,10 +1113,10 @@ bool FbxConverter::save_animations(const vector<KeyFrameVec4> &frames) {
       float t = (float)frames[i].time;
       writer.write(*(uint32 *)&t, 32);
       const D3DXVECTOR4 &cur = frames[i].value;
-      writer.write(quantize((cur.x - center.x) / extents.x, g_animation_bits), g_animation_bits);
-      writer.write(quantize((cur.y - center.y) / extents.y, g_animation_bits), g_animation_bits);
-      writer.write(quantize((cur.z - center.z) / extents.z, g_animation_bits), g_animation_bits);
-      writer.write(quantize((cur.w - center.w) / extents.w, g_animation_bits), g_animation_bits);
+      writer.write(quantize((cur.x - center.x) / extents.x, gAnimationBits), gAnimationBits);
+      writer.write(quantize((cur.y - center.y) / extents.y, gAnimationBits), gAnimationBits);
+      writer.write(quantize((cur.z - center.z) / extents.z, gAnimationBits), gAnimationBits);
+      writer.write(quantize((cur.w - center.w) / extents.w, gAnimationBits), gAnimationBits);
     }
   }
 
@@ -1438,7 +1470,7 @@ string wide_char_to_utf8(LPCWSTR str, int len_in_bytes) {
   return string(buf);
 }
 
-int parse_cmd_line(LPSTR lpCmdLine) {
+int parseCommandLine(LPSTR lpCmdLine) {
   vector<string> tokens;
   boost::split(tokens, lpCmdLine, boost::is_any_of("\t "));
 
@@ -1447,52 +1479,57 @@ int parse_cmd_line(LPSTR lpCmdLine) {
 
   int argc = (int)tokens.size();
 
-  int arg_count = 0;
+  int argCount = 0;
   int num_args = argc - 1;
   for (int i = 0; i < num_args; ++i) {
 
     if (tokens[i] == "--verbose") {
-      arg_count++;
+      argCount++;
       g_verbose = true;
     }
 
     if (tokens[i] == "--watch") {
-      arg_count++;
+      argCount++;
       g_file_watch = true;
     }
 
+    if (tokens[i] == "--compress-verts") {
+      argCount++;
+      gCompressVertices = true;
+    }
+
     if (tokens[i] == "--no-anim") {
-      arg_count++;
-      g_export_animation = false;
+      argCount++;
+      gExportAnimation = false;
     }
 
     if (tokens[i] == "--no-opt") {
-      arg_count++;
-      g_optimize_mesh = false;
+      argCount++;
+      gOptimizeMesh = false;
     }
 
     if (tokens[i] == "--pos-bits" && i != num_args - 1) {
-      arg_count += 2;
-      g_position_bits = atoi(tokens[++i].c_str());
+      argCount += 2;
+      gPositionBits = atoi(tokens[++i].c_str());
     }
 
     if (tokens[i] == "--normal-bits" && i != num_args - 1) {
-      arg_count += 2;
-      g_normal_bits = atoi(tokens[++i].c_str());
+      argCount += 2;
+      gNormalBits = atoi(tokens[++i].c_str());
     }
 
     if (tokens[i] == "--tex-bits" && i != num_args - 1) {
-      arg_count += 2;
-      g_texcoord_bits = atoi(tokens[++i].c_str());
+      argCount += 2;
+      gTexCoordBits = atoi(tokens[++i].c_str());
     }
 
     if (tokens[i] == "--anim-bits" && i != num_args - 1) {
-      arg_count += 2;
-      g_animation_bits = atoi(tokens[++i].c_str());
+      argCount += 2;
+      gAnimationBits = atoi(tokens[++i].c_str());
     }
   }
 
-  int numFiles = argc - arg_count;
+  int numFiles = argc - argCount;
   if (numFiles < 1) {
     printf("syntax: %s [--verbose] [--watch] [--no-anim] [--no-opt] [--pos-bits NN] [--normal-bits NN] [--tex-bits NN] [--anim-bits NN] src [dst]", module_name);
     return 1;
@@ -1579,48 +1616,83 @@ DWORD WINAPI WatcherThread(LPVOID param) {
 void FbxConverter::compact_vertex_data(const SubMesh *submesh, BitWriter *writer) {
   int len = submesh->element_size * submesh->vertices.size();
 
+  int vertexFlags = submesh->vertex_flags;
+
   Mesh *mesh = submesh->mesh;
-  for (size_t i = 0; i < submesh->vertices.size(); ++i) {
 
-    auto &vtx = submesh->vertices[i];
-    // save vertices as 14 bit
-    D3DXVECTOR3 ofs = vtx.pos - mesh->center;
-    ofs.x /= (fabs(mesh->extents.x) > 0.001f ? mesh->extents.x : 1);
-    ofs.y /= (fabs(mesh->extents.y) > 0.001f ? mesh->extents.y : 1);
-    ofs.z /= (fabs(mesh->extents.z) > 0.001f ? mesh->extents.z : 1);
+  if (gCompressVertices) {
 
-    assert(ofs.x >= -1 && ofs.x <= 1);
-    assert(ofs.y >= -1 && ofs.y <= 1);
-    assert(ofs.z >= -1 && ofs.z <= 1);
+    for (size_t i = 0; i < submesh->vertices.size(); ++i) {
 
-    writer->write(quantize(ofs.x, g_position_bits), g_position_bits);
-    writer->write(quantize(ofs.y, g_position_bits), g_position_bits);
-    writer->write(quantize(ofs.z, g_position_bits), g_position_bits);
+      auto &vtx = submesh->vertices[i];
+      // save vertices as 14 bit
+      D3DXVECTOR3 ofs = vtx.pos - mesh->center;
+      ofs.x /= (fabs(mesh->extents.x) > 0.001f ? mesh->extents.x : 1);
+      ofs.y /= (fabs(mesh->extents.y) > 0.001f ? mesh->extents.y : 1);
+      ofs.z /= (fabs(mesh->extents.z) > 0.001f ? mesh->extents.z : 1);
 
-    int vertexFlags = submesh->vertex_flags;
+      assert(ofs.x >= -1 && ofs.x <= 1);
+      assert(ofs.y >= -1 && ofs.y <= 1);
+      assert(ofs.z >= -1 && ofs.z <= 1);
 
-    auto &writeNormal = [&](const D3DXVECTOR3 &n) {
-      // save normal as 11 bit x/y, and 1 sign bit for z
-      writer->write(quantize(n.x, g_normal_bits), g_normal_bits);
-      writer->write(quantize(n.y, g_normal_bits), g_normal_bits);
-      writer->write(n.z < 0 ? 1 : 0, 1);
-    };
-    writeNormal(vtx.normal);
-    if (vertexFlags & SubMesh::kTangentSpace) {
-      writeNormal(vtx.tangent);
-      writeNormal(vtx.binormal);
+      writer->write(quantize(ofs.x, gPositionBits), gPositionBits);
+      writer->write(quantize(ofs.y, gPositionBits), gPositionBits);
+      writer->write(quantize(ofs.z, gPositionBits), gPositionBits);
+
+      auto &writeNormal = [&](const D3DXVECTOR3 &n) {
+        // save normal as 11 bit x/y, and 1 sign bit for z
+        writer->write(quantize(n.x, gNormalBits), gNormalBits);
+        writer->write(quantize(n.y, gNormalBits), gNormalBits);
+        writer->write(n.z < 0 ? 1 : 0, 1);
+      };
+      writeNormal(vtx.normal);
+      if (vertexFlags & SubMesh::kTangentSpace) {
+        writeNormal(vtx.tangent);
+        writeNormal(vtx.binormal);
+      }
+
+      if (vertexFlags & SubMesh::kTex0) {
+        // 11 bit u/v
+        writer->write(quantize(vtx.tex0.x, gTexCoordBits), gTexCoordBits);
+        writer->write(quantize(vtx.tex0.y, gTexCoordBits), gTexCoordBits);
+      }
+
+      if (vertexFlags & SubMesh::kTex1) {
+        writer->write(quantize(vtx.tex1.x, gTexCoordBits), gTexCoordBits);
+        writer->write(quantize(vtx.tex1.y, gTexCoordBits), gTexCoordBits);
+      }
     }
 
-    if (vertexFlags & SubMesh::kTex0) {
-      // 11 bit u/v
-      writer->write(quantize(vtx.tex0.x, g_texcoord_bits), g_texcoord_bits);
-      writer->write(quantize(vtx.tex0.y, g_texcoord_bits), g_texcoord_bits);
+  } else {
+
+    auto &writeFloat = [&](float a) { writer->write(*(uint32 *)&a, 32); };
+    auto &writeVector2 = [&](const D3DXVECTOR2 &v) { writeFloat(v.x); writeFloat(v.y); };
+    auto &writeVector3 = [&](const D3DXVECTOR3 &v) { writeFloat(v.x); writeFloat(v.y); writeFloat(v.z); };
+    for (size_t i = 0; i < submesh->vertices.size(); ++i) {
+
+      auto &vtx = submesh->vertices[i];
+
+      writeVector3(vtx.pos);
+      writeVector3(vtx.normal);
+
+      if (vertexFlags & SubMesh::kTangentSpace) {
+        writeVector3(vtx.tangent);
+        writeVector3(vtx.binormal);
+      }
+
+      if (vertexFlags & SubMesh::kTex0) {
+        writeVector2(vtx.tex0);
+      }
+
+      if (vertexFlags & SubMesh::kTex1) {
+        writeVector2(vtx.tex1);
+      }
+
     }
-    if (vertexFlags & SubMesh::kTex1) {
-      writer->write(quantize(vtx.tex1.x, g_texcoord_bits), g_texcoord_bits);
-      writer->write(quantize(vtx.tex1.y, g_texcoord_bits), g_texcoord_bits);
-    }
+
+
   }
+
 }
 
 
@@ -1648,38 +1720,76 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
   switch (msg) {
 
-  case WM_TIMER:
-    if (wparam == FILE_CHANGED_TIMER_ID) {
-      PostMessage(hwnd, WM_USER_CONVERT_FILE, 0, 0);
+    case WM_TIMER:
+      if (wparam == FILE_CHANGED_TIMER_ID) {
+        PostMessage(hwnd, WM_USER_CONVERT_FILE, 0, 0);
+        return 0;
+      }
+      break;
+
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+
+    case WM_USER_CONVERT_FILE: {
+
+      KillTimer(g_hwnd, FILE_CHANGED_TIMER_ID);
+      g_converter = new FbxConverter();
+      if (!g_converter->convert(g_src.c_str(), g_dst.c_str())) {
+        PostQuitMessage(1);
+      }
+      SAFE_DELETE(g_converter);
       return 0;
     }
-    break;
-
-  case WM_DESTROY:
-    PostQuitMessage(0);
-    return 0;
-
-  case WM_USER_CONVERT_FILE: {
-
-    KillTimer(g_hwnd, FILE_CHANGED_TIMER_ID);
-    g_converter = new FbxConverter();
-    if (!g_converter->convert(g_src.c_str(), g_dst.c_str())) {
-      PostQuitMessage(1);
-    }
-    SAFE_DELETE(g_converter);
-    return 0;
-                             }
-
   }
 
   return DefWindowProc(hwnd, msg, wparam, lparam);
 }
+
+bool fileExists(const char *filename)
+{
+  struct _stat status;
+  return _access(filename, 0) == 0 && _stat(filename, &status) == 0 && (status.st_mode & _S_IFREG);
+}
+
+void findAppRoot()
+{
+  char startingDir[MAX_PATH];
+  _getcwd(startingDir, MAX_PATH);
+
+  // keep going up directory levels until we find "app.json", or we hit the bottom..
+  char prevDir[MAX_PATH], curDir[MAX_PATH];
+  ZeroMemory(prevDir, sizeof(prevDir));
+
+  while (true) {
+    _getcwd(curDir, MAX_PATH);
+    // check if we haven't moved
+    if (!strcmp(curDir, prevDir))
+      break;
+
+    memcpy(prevDir, curDir, MAX_PATH);
+
+    if (fileExists("fbx_conv.ini")) {
+      gAppRoot = curDir;
+      return;
+    }
+
+    if (_chdir("..") == -1)
+      break;
+  }
+  gAppRoot = startingDir;
+}
+
+
+
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
 
   AllocConsole();
   freopen("CONOUT$","wb",stdout);
   freopen("CONOUT$","wb",stderr);
+
+  findAppRoot();
 
   char iniFile[MAX_PATH];
   _getcwd(iniFile, sizeof(iniFile));
@@ -1702,7 +1812,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
   HANDLE console_handle = GetStdHandle(STD_INPUT_HANDLE);
 
-  if (parse_cmd_line(lpCmdLine))
+  if (parseCommandLine(lpCmdLine))
     return 1;
 
   MSG msg;
